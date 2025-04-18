@@ -2814,10 +2814,10 @@ void dynamicDetector::publishDynamicObstacleVelocities()
   int count = 0;
   for (const auto& box : this->dynamicBBoxes_)
   {
-    // Only publish if velocity is significant
+    // Only publish if velocity is significant (do we need this?)
     double vNorm = std::sqrt(box.Vx * box.Vx + box.Vy * box.Vy);
-    if (vNorm < 0.01)
-      continue;
+    // if (vNorm < 0.01)
+    //   continue;
     visualization_msgs::Marker arrow;
     arrow.header.frame_id = "map";
     arrow.header.stamp = ros::Time::now();
