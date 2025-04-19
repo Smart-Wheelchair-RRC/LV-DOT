@@ -1298,6 +1298,7 @@ void dynamicDetector::visCB(const ros::TimerEvent&)
 
   this->publishHistoryTraj();
   this->publishVelVis();
+  this->publishDynamicObstacleVelocities(); // ensuring we publish velocities
 }
 
 void dynamicDetector::uvDetect()
@@ -2778,7 +2779,7 @@ void dynamicDetector::publishVelVis()
     double vx = this->trackedBBoxes_[i].Vx;
     double vy = this->trackedBBoxes_[i].Vy;
     double vNorm = sqrt(vx * vx + vy * vy);
-    cout << "normal" << vNorm << endl;
+    // cout << "normal" << vNorm << endl;
     // Only publish if velocity norm is greater than 0.2
     // if((1.5 >= vNorm)  && (vNorm> 0.5)){
     visualization_msgs::Marker velMarker;
@@ -2832,6 +2833,11 @@ void dynamicDetector::publishDynamicObstacleVelocities()
     arrow.color.g = 0.0;
     arrow.color.b = 1.0;
     arrow.color.a = 1.0;
+    arrow.pose.orientation.x = 0.0;
+    arrow.pose.orientation.y = 0.0;
+    arrow.pose.orientation.z = 0.0;
+    arrow.pose.orientation.w = 1.0;
+    // arrow.lifetime = ros::Duration(0.1); // keep marker visible
     geometry_msgs::Point start, end;
     start.x = box.x;
     start.y = box.y;
@@ -2842,6 +2848,26 @@ void dynamicDetector::publishDynamicObstacleVelocities()
     arrow.points.push_back(start);
     arrow.points.push_back(end);
     dynamicObsVelMsg.markers.push_back(arrow);
+
+    visualization_msgs::Marker velTextMarker;
+    velTextMarker.header.frame_id = "map";
+    velTextMarker.header.stamp = ros::Time::now();
+    velTextMarker.ns = "dynamic_obstacle_velocity_text";
+    velTextMarker.id = count++;
+    velTextMarker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    velTextMarker.pose.position.x = box.x;
+    velTextMarker.pose.position.y = box.y;
+    velTextMarker.pose.position.z = box.z + box.z_width / 2.0 + 0.3;
+    velTextMarker.scale.x = 0.15;
+    velTextMarker.scale.y = 0.15;
+    velTextMarker.scale.z = 0.15;
+    velTextMarker.color.r = 1.0;
+    velTextMarker.color.g = 1.0;
+    velTextMarker.color.b = 0.0;
+    velTextMarker.color.a = 1.0;
+    velTextMarker.text =
+        "Vx=" + std::to_string(box.Vx) + ", Vy=" + std::to_string(box.Vy) + ", |V|=" + std::to_string(vNorm);
+    dynamicObsVelMsg.markers.push_back(velTextMarker);
   }
   this->dynamicObstacleVelPub_.publish(dynamicObsVelMsg);
 }
