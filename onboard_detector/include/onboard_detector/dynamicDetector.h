@@ -77,6 +77,7 @@ namespace onboardDetector{
         ros::Publisher historyTrajPub_;
         ros::Publisher velVisPub_;
         ros::ServiceServer getDynamicObstacleServer_;
+        ros::Publisher dynamicObstacleVelPub_; //added for dynamic obstacle velocity
     
         // DETECTOR
         std::shared_ptr<onboardDetector::UVdetector> uvDetector_;
@@ -276,6 +277,7 @@ namespace onboardDetector{
         void publishLidarClusters();
         void publishFilteredPoints();
         void publishRawDynamicPoints();
+        void publishDynamicObstacleVelocities();
 
         // helper function
         void transformBBox(const Eigen::Vector3d& center, const Eigen::Vector3d& size, const Eigen::Vector3d& position, const Eigen::Matrix3d& orientation,

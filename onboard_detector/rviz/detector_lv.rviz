@@ -231,6 +231,14 @@ Visualization Manager:
       Queue Size: 100
       Value: false
     - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /onboard_detector/dynamic_obstacle_velocity
+      Name: Dynamic Velocity Info
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
       Enabled: false
       Marker Topic: /onboard_detector/history_trajectories
       Name: Historic Trajectory
