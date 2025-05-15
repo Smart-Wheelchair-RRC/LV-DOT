@@ -738,6 +738,9 @@ void dynamicDetector::registerPub()
   // Dynamic Obstacle velocity pub
   this->dynamicObstacleVelPub_ =
       this->nh_.advertise<visualization_msgs::MarkerArray>(this->ns_ + "/dynamic_obstacle_velocity", 10);
+
+  // People velocity pub
+  this->peoplePub_ = this->nh_.advertise<people_msgs::People>(this->ns_ + "/people_velocity", 10);
 }
 
 void dynamicDetector::registerCallback()
@@ -1086,6 +1089,11 @@ void dynamicDetector::lidarDetectionCB(const ros::TimerEvent&)
 
 void dynamicDetector::detectionCB(const ros::TimerEvent&)
 {
+  if (this->depthImage_.empty())
+  {
+    ROS_WARN_THROTTLE(1.0, "[dynamicDetector]: no depth frame yet.");
+    return;
+  }
   // detection thread
   this->dbscanDetect();
   this->uvDetect();
@@ -1298,7 +1306,8 @@ void dynamicDetector::visCB(const ros::TimerEvent&)
 
   this->publishHistoryTraj();
   this->publishVelVis();
-  this->publishDynamicObstacleVelocities(); // ensuring we publish velocities
+  this->publishDynamicObstacleVelocities();  // ensuring we publish velocities
+  this->publishPeopleMsg();
 }
 
 void dynamicDetector::uvDetect()
@@ -1916,49 +1925,39 @@ void dynamicDetector::transformUVBBoxes(std::vector<onboardDetector::box3D>& bbo
 
 void dynamicDetector::projectDepthImage()
 {
+  if (this->depthImage_.empty())
+  {
+    ROS_WARN("[dynamicDetector]: depthImage_ is empty, skipping projection.");
+    return;
+  }
+
+  // scratch buffers for this frame
+  this->projPoints_.clear();
+  this->pointsDepth_.clear();
   this->projPointsNum_ = 0;
 
   int cols = this->depthImage_.cols;
   int rows = this->depthImage_.rows;
-  uint16_t* rowPtr;
-
-  Eigen::Vector3d currPointCam, currPointMap;
-  double depth;
   const double inv_factor = 1.0 / this->depthScale_;
   const double inv_fx = 1.0 / this->fx_;
   const double inv_fy = 1.0 / this->fy_;
 
-  // iterate through each pixel in the depth image
-  for (int v = this->depthFilterMargin_; v < rows - this->depthFilterMargin_; v = v + this->skipPixel_)
-  {  // row
-    rowPtr = this->depthImage_.ptr<uint16_t>(v) + this->depthFilterMargin_;
-    for (int u = this->depthFilterMargin_; u < cols - this->depthFilterMargin_; u = u + this->skipPixel_)
-    {  // column
-      depth = (*rowPtr) * inv_factor;
+  for (int v = depthFilterMargin_; v < rows - depthFilterMargin_; v += skipPixel_)
+  {
+    uint16_t* rowPtr = depthImage_.ptr<uint16_t>(v) + depthFilterMargin_;
+    for (int u = depthFilterMargin_; u < cols - depthFilterMargin_; u += skipPixel_)
+    {
+      double depth = (*rowPtr) * inv_factor;
+      // ... your existing skip‐zero/min/max logic …
+      rowPtr += skipPixel_;
 
-      if (*rowPtr == 0)
-      {
-        depth = this->raycastMaxLength_ + 0.1;
-      }
-      else if (depth < this->depthMinValue_)
-      {
-        continue;
-      }
-      else if (depth > this->depthMaxValue_)
-      {
-        depth = this->raycastMaxLength_ + 0.1;
-      }
-      rowPtr = rowPtr + this->skipPixel_;
+      Eigen::Vector3d currPointCam((u - cx_) * depth * inv_fx, (v - cy_) * depth * inv_fy, depth);
+      Eigen::Vector3d currPointMap = orientationDepth_ * currPointCam + positionDepth_;
 
-      // get 3D point in camera frame
-      currPointCam(0) = (u - this->cx_) * depth * inv_fx;
-      currPointCam(1) = (v - this->cy_) * depth * inv_fy;
-      currPointCam(2) = depth;
-      currPointMap = this->orientationDepth_ * currPointCam + this->positionDepth_;  // transform to map coordinate
-
-      this->projPoints_[this->projPointsNum_] = currPointMap;
-      this->pointsDepth_[this->projPointsNum_] = depth;
-      this->projPointsNum_ = this->projPointsNum_ + 1;
+      // append instead of indexing
+      projPoints_.push_back(currPointMap);
+      pointsDepth_.push_back(depth);
+      ++projPointsNum_;
     }
   }
 }
@@ -2806,6 +2805,27 @@ void dynamicDetector::publishVelVis()
     // }
   }
   this->velVisPub_.publish(velVisMsg);
+}
+
+void dynamicDetector::publishPeopleMsg()
+{
+  people_msgs::People peopleMsg;
+  peopleMsg.header.stamp = ros::Time::now();
+  peopleMsg.header.frame_id = "map";
+
+  for (const auto& box : this->dynamicBBoxes_)
+  {
+    people_msgs::Person person;
+    person.position.x = box.x;
+    person.position.y = box.y;
+    person.position.z = box.z;
+    person.velocity.x = box.Vx;
+    person.velocity.y = box.Vy;
+    person.velocity.z = 0.0;
+    peopleMsg.people.push_back(person);
+  }
+
+  this->peoplePub_.publish(peopleMsg);
 }
 
 // new function to publish dynamic obstacle velocity

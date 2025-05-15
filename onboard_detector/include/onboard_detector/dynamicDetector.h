@@ -31,6 +31,8 @@
 #include <onboard_detector/kalmanFilter.h>
 #include <onboard_detector/utils.h>
 #include <onboard_detector/GetDynamicObstacles.h>
+#include <people_msgs/People.h>
+
 
 namespace onboardDetector{
     class dynamicDetector{
@@ -78,6 +80,8 @@ namespace onboardDetector{
         ros::Publisher velVisPub_;
         ros::ServiceServer getDynamicObstacleServer_;
         ros::Publisher dynamicObstacleVelPub_; //added for dynamic obstacle velocity
+        ros::Publisher peoplePub_; // publishes dynamic obstacles as people messages (for MPC)
+
     
         // DETECTOR
         std::shared_ptr<onboardDetector::UVdetector> uvDetector_;
@@ -278,6 +282,8 @@ namespace onboardDetector{
         void publishFilteredPoints();
         void publishRawDynamicPoints();
         void publishDynamicObstacleVelocities();
+        void publishPeopleMsg(); // publishes dynamic obstacles as people messages (for MPC)
+
 
         // helper function
         void transformBBox(const Eigen::Vector3d& center, const Eigen::Vector3d& size, const Eigen::Vector3d& position, const Eigen::Matrix3d& orientation,
