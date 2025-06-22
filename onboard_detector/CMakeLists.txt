@@ -223,3 +223,9 @@ target_link_libraries(fake_detector_node ${PROJECT_NAME})
 
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
+
+## Install JRDB feeder
+catkin_install_python(
+  PROGRAMS scripts/jrdb_feeder_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
