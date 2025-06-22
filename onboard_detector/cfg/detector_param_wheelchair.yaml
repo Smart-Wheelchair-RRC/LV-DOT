@@ -40,15 +40,20 @@ ground_height: -1.2 # height of ground to remove ground points
 roof_height: 0.5 # relative height of roof to remove roof points
 
 # DBSCAN visual param
-voxel_occupied_thresh: 5 # min num of points for a voxel to be occupied in voxel filter
+voxel_occupied_thresh: 2 # min num of points for a voxel to be occupied in voxel filter #def - 5
 dbscan_min_points_cluster: 20 # 20: 4.0m range; 30: 3.5m range 40: 3.0m range
 dbscan_search_range_epsilon: 0.05 # searching range radius
 
-# DBSCAN LiDAR param
-lidar_DBSCAN_min_points: 10
-lidar_DBSCAN_epsilon: 0.05
-downsample_threshold: 3500 # threshold for downsampling
-gaussian_downsample_rate: 6
+# DBSCAN LiDAR param # default
+# lidar_DBSCAN_min_points: 10
+# lidar_DBSCAN_epsilon: 0.05
+# downsample_threshold: 3500 # threshold for downsampling defaul - 3k - 3.5k
+# gaussian_downsample_rate: 6
+
+lidar_DBSCAN_min_points: 3
+lidar_DBSCAN_epsilon: 0.03
+downsample_threshold: 1500 # threshold for downsampling defaul - 3k - 3.5k
+gaussian_downsample_rate: 2
 
 # LiDAR Visual Filtering
 filtering_BBox_IOU_threshold: 0.2
@@ -72,6 +77,7 @@ frames_force_dynamic_check_range: 30 # threshold for forcing dynamic obstacles
 dynamic_consistency_threshold: 15 # obstacles being voted as dynamic for continuous k frames are eligible to be classified as dynamic
 
 # Constrain size
-target_constrain_size: true
-target_object_size: [0.5, 0.5, 1.5]
+target_constrain_size: false # def- true
+# target_object_size: [0.1, 0.1, 0.1]
+target_object_size: [0.5, 0.5, 1.5] # ]
 max_object_size: [3.0, 3.0, 2.0] # filter out objects that are too large
