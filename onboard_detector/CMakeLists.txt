@@ -226,6 +226,8 @@ target_link_libraries(fake_detector_node ${PROJECT_NAME})
 
 ## Install JRDB feeder
 catkin_install_python(
-  PROGRAMS scripts/jrdb_feeder_node.py
+  PROGRAMS
+    scripts/jrdb_feeder_node.py
+    scripts/dynamic_bbox_collector.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

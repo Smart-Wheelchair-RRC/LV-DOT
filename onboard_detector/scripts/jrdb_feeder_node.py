@@ -173,7 +173,12 @@ class JRDBFeederNode(object):
             self.pub_odom.publish(odom)
 
             # Next
-            self.idx = (self.idx + 1) % len(self.dataset)
+            self.idx += 1
+            print(self.idx)
+            if self.idx >= len(self.dataset):
+                rospy.loginfo('Sequence completed. Shutting down node.')
+                rospy.signal_shutdown('Sequence completed')
+                break
             self.rate.sleep()
 
 if __name__ == '__main__':
