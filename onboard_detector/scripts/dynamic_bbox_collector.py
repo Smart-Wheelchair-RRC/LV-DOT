@@ -92,7 +92,10 @@ class DynamicBBoxCollector:
         boxes_obj = self.latest_boxes_objs
         # extract point cloud
         points = np.array([p for p in pc2.read_points(pcd_msg, skip_nans=True, field_names=('x','y','z'))])
-        masks_per_box = [points_in_box(b, points.T) for b in boxes_obj]
+        # masks_per_box = [points_in_box(b, points.T*[1,-1,1]) for b in boxes_obj]
+        scale = np.array([1, -1, 1]).reshape(3, 1)   # column-vector, shape (3×1)
+        points_flipped = points.T * scale             # now broadcasts to (3×N)
+        masks_per_box  = [points_in_box(b, points_flipped) for b in boxes_obj]
         if masks_per_box:
             mask_any = np.any(np.stack(masks_per_box), axis=0)
         else:

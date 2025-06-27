@@ -63,7 +63,16 @@ class JRDBDataset(Dataset):
 
     def _load_pcd(self, path):
         pcd = o3d.io.read_point_cloud(path)
-        return np.asarray(pcd.points, dtype=np.float32)
+        points = np.asarray(pcd.points, dtype=np.float32)
+        # Ensure we have valid points and reasonable coordinate ranges
+        if len(points) == 0:
+            return points
+        # Log point cloud stats for debugging
+        print(f"Loaded PCD: {points.shape[0]} points, "
+              f"x:[{points[:,0].min():.2f},{points[:,0].max():.2f}], "
+              f"y:[{points[:,1].min():.2f},{points[:,1].max():.2f}], "
+              f"z:[{points[:,2].min():.2f},{points[:,2].max():.2f}]")
+        return points
 
     def _load_depth(self, path):
         depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -145,24 +154,28 @@ class JRDBFeederNode(object):
                 continue
             sample = self.dataset[self.idx]
 
+            # Use consistent timestamps across all messages
+            current_time = rospy.Time.now()
+
             # RGB image
             img_msg = self.bridge.cv2_to_imgmsg(sample['image'], encoding='rgb8')
-            img_msg.header.stamp = rospy.Time.now()
+            img_msg.header.stamp = current_time
             img_msg.header.frame_id = 'camera_link'
             self.pub_image.publish(img_msg)
 
             # Predicted depth image
             depth = sample['depth']
             depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
-            depth_msg.header = img_msg.header
+            depth_msg.header.stamp = current_time
+            depth_msg.header.frame_id = 'camera_link'
             self.pub_depth.publish(depth_msg)
 
             # PointCloud2 with mask in 'intensity'
             xyz = sample['points'].numpy()
             mask = np.zeros(xyz.shape[0], dtype=np.float32)  # no masks available
             header = Header()
-            header.stamp = rospy.Time.now()
-            header.frame_id = 'livox_frame'
+            header.stamp = current_time
+            header.frame_id = 'base_link'  # Use consistent frame_id
 
             fields = [
                 pc2.PointField('x', 0, pc2.PointField.FLOAT32, 1),
@@ -178,7 +191,8 @@ class JRDBFeederNode(object):
 
             # Static odometry
             odom = Odometry()
-            odom.header = header
+            odom.header.stamp = current_time
+            odom.header.frame_id = 'base_link'
             odom.child_frame_id = 'base_link'
             odom.pose.pose = Pose()
             odom.pose.pose.orientation = GeoQuaternion(0.0, 0.0, 0.0, 1.0)
