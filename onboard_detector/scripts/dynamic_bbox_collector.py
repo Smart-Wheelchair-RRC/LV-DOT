@@ -53,25 +53,18 @@ def points_in_box(box, points):
 # — node to collect boxes —
 class DynamicBBoxCollector:
     def __init__(self):
-        # parameters for output
-        self.data_dir = rospy.get_param('~data_dir', '.')
-        self.sequence = rospy.get_param('~sequence', 'default_seq')
-        # prepare output directories per sequence
-        self.bboxes_dir = os.path.join(self.data_dir, 'bboxes', 'upper_velodyne', self.sequence)
-        self.masks_dir = os.path.join(self.data_dir, 'masks', 'upper_velodyne', self.sequence)
-        os.makedirs(self.bboxes_dir, exist_ok=True)
-        os.makedirs(self.masks_dir, exist_ok=True)
-        # frame counter for file naming
-        self.frame_idx = 0
-        # storage for sequence data
-        self.sequence_boxes = []  # list of per-frame box arrays
-        self.sequence_masks = []  # list of per-frame masks for points
-        # storage for latest box detections
-        self.latest_boxes_objs = []
-        self.latest_boxes_arr = np.zeros((0,7))
         # subscribers for boxes and pointcloud
         rospy.Subscriber('/onboard_detector/dynamic_bboxes', MarkerArray, self.bbox_callback, queue_size=1)
         rospy.Subscriber('/livox/pcd', PointCloud2, self.pcd_callback, queue_size=1)
+
+        # Base output directory for all sequences
+        self.results_base = rospy.get_param('~results_dir', '/scratch/gaurav_kumar/results')
+        # Track current sequence and per-sequence frame index
+        self.sequence = None
+        self.frame_idx = 0
+        # Placeholders for latest box detections
+        self.latest_boxes_objs = []
+        self.latest_boxes_arr = np.zeros((0,7))
 
     def bbox_callback(self, msg: MarkerArray):
         # update latest boxes
@@ -88,6 +81,12 @@ class DynamicBBoxCollector:
         self.latest_boxes_arr = np.array(boxes_list)
 
     def pcd_callback(self, pcd_msg: PointCloud2):
+        # Determine current sequence from ROS parameter
+        current_seq = rospy.get_param('sequence', None)
+        if not current_seq:
+            return
+        self._ensure_sequence_dirs(current_seq)
+
         # ensure we have a recent box list
         boxes_arr = self.latest_boxes_arr
         boxes_obj = self.latest_boxes_objs
@@ -104,6 +103,16 @@ class DynamicBBoxCollector:
         np.save(os.path.join(self.masks_dir, fname), mask_any.astype(np.uint8))
         rospy.loginfo(f"Saved frame {self.frame_idx:06d}: {boxes_arr.shape[0]} boxes, {int(mask_any.sum())} masked points")
         self.frame_idx += 1
+
+    def _ensure_sequence_dirs(self, seq_name):
+        if seq_name != self.sequence:
+            self.sequence = seq_name
+            self.frame_idx = 0
+            # Create per-sequence output dirs
+            self.bboxes_dir = os.path.join(self.results_base, 'bboxes', 'upper_velodyne', seq_name)
+            self.masks_dir  = os.path.join(self.results_base, 'masks', 'upper_velodyne', seq_name)
+            os.makedirs(self.bboxes_dir, exist_ok=True)
+            os.makedirs(self.masks_dir, exist_ok=True)
 
 if __name__ == '__main__':
     rospy.init_node('dynamic_bbox_collector')

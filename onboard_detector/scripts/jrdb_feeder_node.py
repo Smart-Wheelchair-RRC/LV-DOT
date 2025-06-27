@@ -27,11 +27,10 @@ class JRDBDataset(Dataset):
         ├── pointclouds/
         │   └── upper_velodyne/
         │       └── <sequence_name>/  # .pcd files
-        └── masks/
-            └── upper_velodyne/
-                └── <sequence_name>/  # .npy mask files
+        └── depth_pred/
+            └── <sequence_name>/  # depth images
 
-    Each sequence folder must contain the same number of images, PCDs, and masks.
+    Each sequence folder must contain the same number of images, PCDs, and depth images.
     """
     def __init__(self, data_dir, sequence, camera='image_0'):
         self.root_dir = os.path.expanduser(data_dir)
@@ -41,16 +40,15 @@ class JRDBDataset(Dataset):
         # Paths for this sequence
         self.img_dir = os.path.join(self.root_dir, 'images', camera, sequence)
         self.pcd_dir = os.path.join(self.root_dir, 'pointclouds', 'upper_velodyne', sequence)
-        self.mask_dir = os.path.join(self.root_dir, 'masks', 'upper_velodyne', sequence)
+        self.depth_dir = os.path.join(self.root_dir, 'depth_pred', sequence)
 
         # List and sort
         self.imgs = sorted(os.listdir(self.img_dir))
         self.pcds = sorted(os.listdir(self.pcd_dir))
-        self.masks = sorted(os.listdir(self.mask_dir))
+        self.depths = sorted(os.listdir(self.depth_dir))
 
-        assert len(self.imgs) == len(self.pcds) == len(self.masks), (
-            f"Mismatch counts: images({len(self.imgs)}), "
-            f"pcds({len(self.pcds)}), masks({len(self.masks)})"
+        assert len(self.imgs) == len(self.pcds) == len(self.depths), (
+            f"Mismatch counts: images({len(self.imgs)}), pcds({len(self.pcds)}), depths({len(self.depths)})"
         )
 
         # Uniform relative timestamps in [0, 1]
@@ -67,28 +65,24 @@ class JRDBDataset(Dataset):
         pcd = o3d.io.read_point_cloud(path)
         return np.asarray(pcd.points, dtype=np.float32)
 
-    def _load_mask(self, path):
-        mask = np.load(path)
-        return (mask > 0).astype(np.float32)
+    def _load_depth(self, path):
+        depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        return depth
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.imgs[idx])
         pcd_path = os.path.join(self.pcd_dir, self.pcds[idx])
-        mask_path = os.path.join(self.mask_dir, self.masks[idx])
+        depth_path = os.path.join(self.depth_dir, self.depths[idx])
         ts = self.timestamps[idx]
 
         image = self._load_image(img_path)
         points = self._load_pcd(pcd_path)
-        mask = self._load_mask(mask_path)
-
-        assert points.shape[0] == mask.shape[0], (
-            f"Point count {points.shape[0]} != mask count {mask.shape[0]}"
-        )
+        depth = self._load_depth(depth_path)
 
         return {
             'image': image,                   # H x W x 3 uint8 (RGB)
             'points': torch.from_numpy(points),
-            'mask': torch.from_numpy(mask),   # N floats (0 or 1)
+            'depth': depth,
             'timestamp': ts
         }
 
@@ -110,12 +104,17 @@ class JRDBFeederNode(object):
         self.bridge = CvBridge()
 
         # Parameters
-        data_dir = rospy.get_param('~data_dir', '/path/to/JRDB')
-        sequence = rospy.get_param('~sequence', 'bytes-cafe-2019-02-07_0')
-        camera = rospy.get_param('~camera', 'image_0')
+        self.data_dir = rospy.get_param('~data_dir', '/path/to/JRDB')
+        self.camera = rospy.get_param('~camera', 'image_0')
 
-        # Dataset
-        self.dataset = JRDBDataset(data_dir, sequence, camera)
+        # Discover all sequences under images/<camera>
+        img_root = os.path.join(self.data_dir, 'images', self.camera)
+        self.sequences = sorted([
+            d for d in os.listdir(img_root)
+            if os.path.isdir(os.path.join(img_root, d))
+        ])
+        self.current_seq_idx = 0
+        self.dataset = None
         self.idx = 0
 
         # Publishers
@@ -129,6 +128,21 @@ class JRDBFeederNode(object):
 
     def spin(self):
         while not rospy.is_shutdown():
+            # Load next sequence if none or finished
+            if self.dataset is None or self.idx >= len(self.dataset):
+                if self.current_seq_idx >= len(self.sequences):
+                    rospy.loginfo('All sequences completed. Shutting down.')
+                    rospy.signal_shutdown('All sequences completed')
+                    break
+                seq_name = self.sequences[self.current_seq_idx]
+                rospy.loginfo(f'Starting sequence {seq_name}')
+                # Notify dynamic_bbox_collector of current sequence
+                rospy.set_param('sequence', seq_name)
+                # Load dataset for this sequence
+                self.dataset = JRDBDataset(self.data_dir, seq_name, self.camera)
+                self.idx = 0
+                self.current_seq_idx += 1
+                continue
             sample = self.dataset[self.idx]
 
             # RGB image
@@ -137,16 +151,15 @@ class JRDBFeederNode(object):
             img_msg.header.frame_id = 'camera_link'
             self.pub_image.publish(img_msg)
 
-            # Dummy depth
-            H, W = sample['image'].shape[:2]
-            depth = np.zeros((H, W), dtype=np.uint16)
-            depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='mono16')
+            # Predicted depth image
+            depth = sample['depth']
+            depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
             depth_msg.header = img_msg.header
             self.pub_depth.publish(depth_msg)
 
             # PointCloud2 with mask in 'intensity'
             xyz = sample['points'].numpy()
-            mask = sample['mask'].numpy().astype(np.float32)
+            mask = np.zeros(xyz.shape[0], dtype=np.float32)  # no masks available
             header = Header()
             header.stamp = rospy.Time.now()
             header.frame_id = 'livox_frame'
@@ -175,10 +188,6 @@ class JRDBFeederNode(object):
             # Next
             self.idx += 1
             print(self.idx)
-            if self.idx >= len(self.dataset):
-                rospy.loginfo('Sequence completed. Shutting down node.')
-                rospy.signal_shutdown('Sequence completed')
-                break
             self.rate.sleep()
 
 if __name__ == '__main__':
