@@ -230,5 +230,8 @@ catkin_install_python(
     scripts/jrdb_feeder_node.py
     scripts/dynamic_bbox_collector.py
     scripts/storage.py
+    scripts/eval/data_feeder.py
+    scripts/eval/data_collector.py
+    scripts/eval/data_eval.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
