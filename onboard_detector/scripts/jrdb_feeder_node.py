@@ -23,7 +23,6 @@ class JRDBDataset(Dataset):
         ├── images/
         │   └── image_0/
         │       └── <sequence_name>/  # e.g. bytes-cafe-2019-02-07_0
-        │           └── 000000.jpg, 000001.jpg, ...
         ├── pointclouds/
         │   └── upper_velodyne/
         │       └── <sequence_name>/  # .pcd files
@@ -32,10 +31,11 @@ class JRDBDataset(Dataset):
 
     Each sequence folder must contain the same number of images, PCDs, and depth images.
     """
-    def __init__(self, data_dir, sequence, camera='image_0'):
+    def __init__(self, data_dir, sequence, camera='image_0', debug=False):
         self.root_dir = os.path.expanduser(data_dir)
         self.sequence = sequence
         self.camera = camera
+        self.debug = debug
 
         # Paths for this sequence
         self.img_dir = os.path.join(self.root_dir, 'images', camera, sequence)
@@ -68,10 +68,11 @@ class JRDBDataset(Dataset):
         if len(points) == 0:
             return points
         # Log point cloud stats for debugging
-        print(f"Loaded PCD: {points.shape[0]} points, "
-              f"x:[{points[:,0].min():.2f},{points[:,0].max():.2f}], "
-              f"y:[{points[:,1].min():.2f},{points[:,1].max():.2f}], "
-              f"z:[{points[:,2].min():.2f},{points[:,2].max():.2f}]")
+        if self.debug and len(points) > 0:
+            print(f"Loaded PCD: {points.shape[0]} points, "
+                  f"x:[{points[:,0].min():.2f},{points[:,0].max():.2f}], "
+                  f"y:[{points[:,1].min():.2f},{points[:,1].max():.2f}], "
+                  f"z:[{points[:,2].min():.2f},{points[:,2].max():.2f}]")
         return points
 
     def _load_depth(self, path):
@@ -115,6 +116,9 @@ class JRDBFeederNode(object):
         # Parameters
         self.data_dir = rospy.get_param('~data_dir', '/path/to/JRDB')
         self.camera = rospy.get_param('~camera', 'image_0')
+        self.debug         = rospy.get_param('~debug', False)
+        self.publish_rate  = rospy.get_param('~publish_rate', 10)
+        self.cloud_frame   = rospy.get_param('~cloud_frame', 'upper_velodyne')
 
         # Discover all sequences under images/<camera>
         img_root = os.path.join(self.data_dir, 'images', self.camera)
@@ -132,7 +136,7 @@ class JRDBFeederNode(object):
         self.pub_pcd = rospy.Publisher('/livox/pcd', PointCloud2, queue_size=1)
         self.pub_odom = rospy.Publisher('/localization', Odometry, queue_size=1)
 
-        self.rate = rospy.Rate(10)
+        self.rate = rospy.Rate(self.publish_rate)
         self.spin()
 
     def spin(self):
@@ -148,7 +152,7 @@ class JRDBFeederNode(object):
                 # Notify dynamic_bbox_collector of current sequence
                 rospy.set_param('sequence', seq_name)
                 # Load dataset for this sequence
-                self.dataset = JRDBDataset(self.data_dir, seq_name, self.camera)
+                self.dataset = JRDBDataset(self.data_dir, seq_name, self.camera, debug=self.debug)
                 self.idx = 0
                 self.current_seq_idx += 1
                 continue
@@ -161,6 +165,7 @@ class JRDBFeederNode(object):
             img_msg = self.bridge.cv2_to_imgmsg(sample['image'], encoding='rgb8')
             img_msg.header.stamp = current_time
             img_msg.header.frame_id = 'camera_link'
+            img_msg.header.seq   = self.idx
             self.pub_image.publish(img_msg)
 
             # Predicted depth image
@@ -168,6 +173,7 @@ class JRDBFeederNode(object):
             depth_msg = self.bridge.cv2_to_imgmsg(depth, encoding='16UC1')
             depth_msg.header.stamp = current_time
             depth_msg.header.frame_id = 'camera_link'
+            depth_msg.header.seq = self.idx
             self.pub_depth.publish(depth_msg)
 
             # PointCloud2 with mask in 'intensity'
@@ -175,7 +181,8 @@ class JRDBFeederNode(object):
             mask = np.zeros(xyz.shape[0], dtype=np.float32)  # no masks available
             header = Header()
             header.stamp = current_time
-            header.frame_id = 'base_link'  # Use consistent frame_id
+            header.frame_id = self.cloud_frame
+            header.seq = self.idx
 
             fields = [
                 pc2.PointField('x', 0, pc2.PointField.FLOAT32, 1),
@@ -193,6 +200,7 @@ class JRDBFeederNode(object):
             odom = Odometry()
             odom.header.stamp = current_time
             odom.header.frame_id = 'base_link'
+            odom.header.seq = self.idx
             odom.child_frame_id = 'base_link'
             odom.pose.pose = Pose()
             odom.pose.pose.orientation = GeoQuaternion(0.0, 0.0, 0.0, 1.0)
@@ -201,7 +209,8 @@ class JRDBFeederNode(object):
 
             # Next
             self.idx += 1
-            print(self.idx)
+            if self.debug:
+                print(f"Published frame {self.idx}")
             self.rate.sleep()
 
 if __name__ == '__main__':
