@@ -195,9 +195,35 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
             pred_boxes = np.load(os.path.join(p_bbox_dir, fname))
             # Load ground-truth boxes (may be object array), allow pickled list loading
             gt_raw = np.load(os.path.join(g_bbox_dir, fname), allow_pickle=True)
-            # If ground-truth loaded as object array of lists, stack into (N,7) float32 array
+            
+            # Handle different ground truth data formats
             if isinstance(gt_raw, np.ndarray) and gt_raw.dtype == object:
-                gt_boxes = np.vstack(gt_raw).astype(np.float32)
+                # Check if it's an array of dictionaries or lists
+                if len(gt_raw) > 0:
+                    if isinstance(gt_raw[0], dict):
+                        # Extract bbox values from dictionaries
+                        # Assuming dict has keys like 'box' or direct coordinate keys
+                        gt_list = []
+                        for item in gt_raw:
+                            if 'box' in item:
+                                gt_list.append(item['box'])
+                            elif all(k in item for k in ['cx', 'cy', 'cz', 'w', 'l', 'h', 'yaw']):
+                                gt_list.append([item['cx'], item['cy'], item['cz'], 
+                                              item['w'], item['l'], item['h'], item['yaw']])
+                            elif all(k in item for k in ['x', 'y', 'z', 'width', 'length', 'height', 'yaw']):
+                                gt_list.append([item['x'], item['y'], item['z'], 
+                                              item['width'], item['length'], item['height'], item['yaw']])
+                            else:
+                                # Try to extract numeric values in order
+                                values = [v for v in item.values() if isinstance(v, (int, float))]
+                                if len(values) >= 7:
+                                    gt_list.append(values[:7])
+                        gt_boxes = np.array(gt_list, dtype=np.float32) if gt_list else np.empty((0, 7), dtype=np.float32)
+                    else:
+                        # Assume it's an array of lists/arrays
+                        gt_boxes = np.vstack(gt_raw).astype(np.float32)
+                else:
+                    gt_boxes = np.empty((0, 7), dtype=np.float32)
             else:
                 gt_boxes = gt_raw.astype(np.float32)
             b_metrics  = compute_box_metrics(pred_boxes, gt_boxes, box_iou_thr)
