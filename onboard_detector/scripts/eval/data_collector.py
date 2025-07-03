@@ -111,14 +111,38 @@ class FinalBBoxCollector:
     # --------------------------------------------------------------------- #
 
     def _box_cb(self, msg: MarkerArray):
+        # boxes, objs = [], []
+        # for m in msg.markers:
+        #     cx, cy, cz = m.pose.position.x, m.pose.position.y, m.pose.position.z
+        #     w, l, h    = m.scale.x, m.scale.y, m.scale.z
+        #     q          = m.pose.orientation
+        #     _, _, yaw  = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        #     boxes.append([cx, cy, cz, w, l, h, yaw])
+        #     objs.append(BBox([cx, cy, cz], [w, l, h], yaw))
         boxes, objs = [], []
         for m in msg.markers:
-            cx, cy, cz = m.pose.position.x, m.pose.position.y, m.pose.position.z
-            w, l, h    = m.scale.x, m.scale.y, m.scale.z
-            q          = m.pose.orientation
-            _, _, yaw  = euler_from_quaternion([q.x, q.y, q.z, q.w])
-            boxes.append([cx, cy, cz, w, l, h, yaw])
-            objs.append(BBox([cx, cy, cz], [w, l, h], yaw))
+            # Re-create absolute coordinates of the 8 unique vertices
+            abs_pts = [(m.pose.position.x + p.x,
+                        m.pose.position.y + p.y,
+                        m.pose.position.z + p.z) for p in m.points]
+
+            if not abs_pts:                 # Safety guard
+                continue
+
+            xs, ys, zs = zip(*abs_pts)
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            zmin, zmax = min(zs), max(zs)
+
+            cx = (xmin + xmax) / 2.0
+            cy = (ymin + ymax) / 2.0
+            cz = (zmin + zmax) / 2.0
+            w  = xmax - xmin
+            l  = ymax - ymin
+            h  = zmax - zmin
+
+            boxes.append([cx, cy, cz, w, l, h, 0.0])   # yaw = 0 (boxes are axis-aligned)
+            objs.append(BBox([cx, cy, cz], [w, l, h], 0.0))
         with self.lock:
             self.latest_boxes_arr = np.asarray(boxes, dtype=np.float32) \
                                     if boxes else np.zeros((0, 7), np.float32)

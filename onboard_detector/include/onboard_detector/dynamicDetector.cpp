@@ -2684,12 +2684,15 @@ void dynamicDetector::publish3dBox(const std::vector<box3D>& boxes, const ros::P
     corner[0].x = -x_width / 2.0;
     corner[0].y = -y_width / 2.0;
     corner[0].z = -z_width;
+
     corner[1].x = -x_width / 2.0;
     corner[1].y = y_width / 2.0;
     corner[1].z = -z_width;
+
     corner[2].x = x_width / 2.0;
     corner[2].y = y_width / 2.0;
     corner[2].z = -z_width;
+
     corner[3].x = x_width / 2.0;
     corner[3].y = -y_width / 2.0;
     corner[3].z = -z_width;
@@ -2697,12 +2700,15 @@ void dynamicDetector::publish3dBox(const std::vector<box3D>& boxes, const ros::P
     corner[4].x = -x_width / 2.0;
     corner[4].y = -y_width / 2.0;
     corner[4].z = z_width;
+
     corner[5].x = -x_width / 2.0;
     corner[5].y = y_width / 2.0;
     corner[5].z = z_width;
+
     corner[6].x = x_width / 2.0;
     corner[6].y = y_width / 2.0;
     corner[6].z = z_width;
+    
     corner[7].x = x_width / 2.0;
     corner[7].y = -y_width / 2.0;
     corner[7].z = z_width;
