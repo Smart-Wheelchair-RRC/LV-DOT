@@ -2667,6 +2667,7 @@ void dynamicDetector::publish3dBox(const std::vector<box3D>& boxes, const ros::P
     line.color.b = b;
     line.color.a = 1.0;
     line.lifetime = ros::Duration(0.05);
+
     line.pose.orientation.x = 0.0;
     line.pose.orientation.y = 0.0;
     line.pose.orientation.z = 0.0;

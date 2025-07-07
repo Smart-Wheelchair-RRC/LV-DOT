@@ -26,19 +26,47 @@ Metrics reported per‑sequence and averaged across sequences:
 * **Masks**  : IoU, Precision, Recall, F1
 
 To run -
-python3 data_eval.py --pred_dir /scratch/gaurav_kumar/results --gt_dir /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0
+python3 data_eval.py --pred_dir /scratch/gaurav_kumar/result --gt_dir  /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0 --cfg_yaml /scratch/gaurav_kumar/lvdot_testing/src/LV-DOT/onboard_detector/cfg/custom_param.yaml
+python3 data_eval.py --pred_dir /scratch/gaurav_kumar/results --gt_dir /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0 (old)
 
 """
 import os
 import argparse
 import numpy as np
 import sys
+import yaml
 # Alias old NumPy internal modules so pickle.load can find them
 sys.modules['numpy._core'] = np.core
 # Some systems name the multiarray in the old path
 if hasattr(np.core, '_multiarray_umath'):
     sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 from scipy.optimize import linear_sum_assignment
+
+# --------------------------------------------------------------------------- #
+#   Helper: Load max evaluation range from yaml                               #
+# --------------------------------------------------------------------------- #
+def load_max_range(cfg_yaml):
+    """
+    Parse custom_param.yaml (or another yaml) to obtain the maximum
+    distance (in metres) within which boxes should be evaluated.
+    The function looks for, in order of preference:
+        - field 'raycastMaxLength' (float)
+        - field 'depth_max_value'
+        - field 'max_eval_range'
+    If none are found, returns None, meaning *no range filter*.
+    """
+    if cfg_yaml is None:
+        return None
+    try:
+        with open(cfg_yaml, 'r') as f:
+            cfg = yaml.safe_load(f)
+    except (FileNotFoundError, yaml.YAMLError):
+        return None
+
+    for key in ('raycastMaxLength', 'depth_max_value', 'max_eval_range'):
+        if key in cfg and isinstance(cfg[key], (int, float)):
+            return float(cfg[key])
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -89,35 +117,24 @@ def bbox_corners(box):
     return corners
 
 
-def bbox_iou_3d(b1, b2):
+def bbox_iou_xy(b1, b2):
     """
-    Approximate 3‑D IoU by projecting to BEV (xy plane) with oriented rectangles,
-    intersecting their z‑ranges, and dividing the volumes.
-    For speed we approximate the BEV overlap by axis‑aligned rectangles that
-    bound the rotated rectangles.
+    2‑D IoU in the XY plane (BEV).  We ignore height to compensate for the
+    fact that LV‑DOT boxes cover only the upper body.
     """
-    # volumes
-    v1 = b1[3] * b1[4] * b1[5]
-    v2 = b2[3] * b2[4] * b2[5]
-
-    # axis‑aligned bounding boxes in BEV
-    c1 = bbox_corners(b1)
-    c2 = bbox_corners(b2)
+    c1, c2 = bbox_corners(b1), bbox_corners(b2)
     min1 = c1[:, :2].min(axis=0); max1 = c1[:, :2].max(axis=0)
     min2 = c2[:, :2].min(axis=0); max2 = c2[:, :2].max(axis=0)
+
     inter_min = np.maximum(min1, min2)
     inter_max = np.minimum(max1, max2)
-    inter_xy = np.maximum(0.0, inter_max - inter_min)
-    inter_area = inter_xy[0] * inter_xy[1]
+    wh = np.maximum(0.0, inter_max - inter_min)
+    inter_area = wh[0] * wh[1]
 
-    # z‑overlap
-    z1_min, z1_max = b1[2] - b1[5]/2.0, b1[2] + b1[5]/2.0
-    z2_min, z2_max = b2[2] - b2[5]/2.0, b2[2] + b2[5]/2.0
-    inter_z = max(0.0, min(z1_max, z2_max) - max(z1_min, z2_min))
-
-    inter_vol = inter_area * inter_z
-    union_vol = v1 + v2 - inter_vol
-    return inter_vol / union_vol if union_vol > 0 else 0.0
+    area1 = (max1[0] - min1[0]) * (max1[1] - min1[1])
+    area2 = (max2[0] - min2[0]) * (max2[1] - min2[1])
+    union_area = area1 + area2 - inter_area
+    return inter_area / union_area if union_area > 0 else 0.0
 
 
 def match_boxes(pred, gt, iou_thr):
@@ -132,7 +149,7 @@ def match_boxes(pred, gt, iou_thr):
     ious = np.zeros((len(pred), len(gt)), dtype=np.float32)
     for i, pb in enumerate(pred):
         for j, gb in enumerate(gt):
-            ious[i, j] = bbox_iou_3d(pb, gb)
+            ious[i, j] = bbox_iou_xy(pb, gb)
 
     # Hungarian on negative IoU (maximize IoU)
     row_ind, col_ind = linear_sum_assignment(-ious)
@@ -165,7 +182,7 @@ def compute_box_metrics(pred_boxes, gt_boxes, iou_thr):
 #   Main evaluation loop                                                      #
 # --------------------------------------------------------------------------- #
 
-def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
+def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0, max_range=None):
     """
     pred_root : directory containing bboxes/ and masks/ trees collected by LV‑DOT
     gt_root   : directory containing JRDB ground‑truth trees
@@ -226,6 +243,34 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
                     gt_boxes = np.empty((0, 7), dtype=np.float32)
             else:
                 gt_boxes = gt_raw.astype(np.float32)
+                
+            # ------ Ensure arrays have shape (N,7); else make them empty ----------
+            def to_Nx7(arr):
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.size == 0:
+                    return np.empty((0, 7), np.float32)
+                if arr.ndim == 1:                       # flat vector
+                    if arr.size == 7:
+                        return arr.reshape(1, 7)
+                    if arr.size % 7 == 0:
+                        return arr.reshape(-1, 7)
+                    return np.empty((0, 7), np.float32)
+                # if it’s 2-D but wrong width, try flatten-reshape
+                if arr.ndim == 2 and arr.shape[1] != 7:
+                    flat = arr.ravel()
+                    if flat.size % 7 == 0:
+                        return flat.reshape(-1, 7)
+                    return np.empty((0, 7), np.float32)
+                return arr
+
+            pred_boxes = to_Nx7(pred_boxes)
+            gt_boxes   = to_Nx7(gt_boxes)    
+            # -------- Range filter (centre‑distance) --------------------
+            if max_range is not None:
+                keep_pred = np.sqrt(pred_boxes[:,0]**2 + pred_boxes[:,1]**2) <= max_range
+                keep_gt   = np.sqrt(gt_boxes[:,0]**2   + gt_boxes[:,1]**2)   <= max_range
+                pred_boxes = pred_boxes[keep_pred]
+                gt_boxes   = gt_boxes[keep_gt]
             b_metrics  = compute_box_metrics(pred_boxes, gt_boxes, box_iou_thr)
             per_file_b.append(b_metrics)
 
@@ -259,11 +304,16 @@ if __name__ == '__main__':
                     help="IoU threshold for bbox TP (default 0.25)")
     ap.add_argument('--mask_thr', type=float, default=0.0,
                     help="Threshold for mask binarisation (default 0)")
+    ap.add_argument('--cfg_yaml', default=None,
+                    help="custom_param.yaml path (for max eval range)")
     args = ap.parse_args()
+
+    max_range = load_max_range(args.cfg_yaml)
 
     seq_scores = evaluate(args.pred_dir, args.gt_dir,
                           box_iou_thr=args.box_iou_thr,
-                          mask_thr=args.mask_thr)
+                          mask_thr=args.mask_thr,
+                          max_range=max_range)
 
     if not seq_scores:
         print("No sequences evaluated – check directory paths.")

@@ -34,7 +34,13 @@ import sensor_msgs.point_cloud2 as pc2
 
 from visualization_msgs.msg import MarkerArray
 from sensor_msgs.msg import PointCloud2
-from tf.transformations import euler_from_quaternion
+
+
+# --------------------------------------------------------------------------- #
+#   TF2 imports                                                              #
+# --------------------------------------------------------------------------- #
+import tf2_ros
+import tf2_sensor_msgs.tf2_sensor_msgs as tf2_sns
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +95,9 @@ class FinalBBoxCollector:
         self.results_base = rospy.get_param('~results_dir',
                                             '/scratch/gaurav_kumar/results')
         self.sequence     = rospy.get_param('~sequence', None)
+        
+        # If you actually have TF frames, set this launch-param to true
+        self.use_tf = rospy.get_param('~use_tf_transform', False)
 
         # Runtime state
         self.frame_idx        = 0
@@ -96,9 +105,15 @@ class FinalBBoxCollector:
         self.latest_boxes_arr = np.zeros((0, 7), dtype=np.float32)
         self.lock             = threading.Lock()
 
-        # I/O
+        # TF listener so we can transform LiDAR clouds into the map frame
+        self.tf_buffer  = tf2_ros.Buffer(rospy.Duration(60))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        # I/O /onboard_detector/tracked_bboxes
         rospy.Subscriber('/onboard_detector/dynamic_bboxes',
                          MarkerArray, self._box_cb, queue_size=10)
+        # rospy.Subscriber('/onboard_detector/tracked_bboxes',
+        #                  MarkerArray, self._box_cb, queue_size=10)
         rospy.Subscriber('/livox/pcd',
                          PointCloud2, self._pcd_cb, queue_size=10)
 
@@ -160,8 +175,29 @@ class FinalBBoxCollector:
             boxes_arr = self.latest_boxes_arr.copy()
             boxes_obj = list(self.latest_boxes_obj)
 
-        # Extract xyz
-        pts = np.array([p for p in pc2.read_points(pcd_msg,
+        # ---- Bring cloud into the same frame as the boxes ----------------------
+        if self.use_tf and pcd_msg.header.frame_id != 'map':
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    'map',                           # target
+                    pcd_msg.header.frame_id,         # source
+                    rospy.Time(0),                   # latest
+                    rospy.Duration(0.1))
+                cloud_map = tf2_sns.do_transform_cloud(pcd_msg, tf)
+            except (tf2_ros.LookupException,
+                    tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException):
+                # Fall back to raw cloud instead of skipping
+                rospy.logwarn_once(
+                    "[data_collector] No TF to 'map'; using raw cloud frame (%s). "
+                    "Masks may be mis-aligned.", pcd_msg.header.frame_id)
+                cloud_map = pcd_msg
+        else:
+            # Either TF disabled or already in map frame
+            cloud_map = pcd_msg
+
+        # Extract xyz in map frame
+        pts = np.array([p for p in pc2.read_points(cloud_map,
                                                    skip_nans=True,
                                                    field_names=('x', 'y', 'z'))],
                        dtype=np.float32)

@@ -18,6 +18,7 @@ find_package(catkin REQUIRED COMPONENTS
   image_transport
   vision_msgs
   message_generation
+  tf2_sensor_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -112,7 +113,7 @@ generate_messages(
 catkin_package(
    INCLUDE_DIRS include
    LIBRARIES onboard_detector
-   CATKIN_DEPENDS roscpp rospy std_msgs message_generation geometry_msgs
+   CATKIN_DEPENDS roscpp rospy std_msgs message_generation geometry_msgs tf2_sensor_msgs
   #  DEPENDS system_lib
 )
 
