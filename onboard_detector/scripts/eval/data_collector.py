@@ -6,7 +6,7 @@ Collect **final** LV‑DOT outputs for quantitative benchmarking against JRDB.
 
 Subscribed Topics
 -----------------
-/onboard_detector/dynamic_bboxes     visualization_msgs/MarkerArray
+/onboard_detector/tracked_bboxes     visualization_msgs/MarkerArray
 /livox/pcd                          sensor_msgs/PointCloud2
 
 Usage
@@ -29,11 +29,16 @@ import os
 import threading
 
 import numpy as np
+import numpy.linalg as LA
 import rospy
 import sensor_msgs.point_cloud2 as pc2
 
+from scipy.spatial.transform import Rotation as R
+
 from visualization_msgs.msg import MarkerArray
 from sensor_msgs.msg import PointCloud2
+from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion
+from scipy.spatial.transform import Rotation as Rsci
 
 
 # --------------------------------------------------------------------------- #
@@ -95,9 +100,12 @@ class FinalBBoxCollector:
         self.results_base = rospy.get_param('~results_dir',
                                             '/scratch/gaurav_kumar/results')
         self.sequence     = rospy.get_param('~sequence', None)
-        
-        # If you actually have TF frames, set this launch-param to true
+
+        # --- TF / frame config -------------------------------------------------
+        # Whether to transform data at all
         self.use_tf = rospy.get_param('~use_tf_transform', False)
+        # Frame in which JRDB ground‑truth lives (from feeder)
+        self.target_frame = rospy.get_param('~target_frame', 'upper_velodyne')
 
         # Runtime state
         self.frame_idx        = 0
@@ -109,11 +117,35 @@ class FinalBBoxCollector:
         self.tf_buffer  = tf2_ros.Buffer(rospy.Duration(60))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
+        # Static transform from body to lidar (for JRDB bags with no TF tree)
+        self.static_tf_ok = False
+        try:
+            body2lidar = rospy.get_param('/onboard_detector/body_to_lidar')
+            if isinstance(body2lidar, list) and len(body2lidar) == 16:
+                body2lidar = np.array(body2lidar, dtype=np.float32).reshape(4,4)
+                # pose = identity in JRDB feeder, so map≈body. We want lidar->map
+                R_bl = body2lidar[:3,:3]
+                t_bl = body2lidar[:3, 3]
+                # quaternion from rotation
+                from scipy.spatial.transform import Rotation as Rsc
+                q = Rsc.from_matrix(R_bl).as_quat()  # x,y,z,w
+                self.static_rot = q
+                self.static_trans = t_bl
+                self.static_tf_ok = True
+        except KeyError:
+            pass
+
+        # keep full 4×4 body→lidar for pose-based transform
+        self.body_T_lidar = None
+        body2lidar_param = rospy.get_param('/onboard_detector/body_to_lidar', None)
+        if isinstance(body2lidar_param, list) and len(body2lidar_param) == 16:
+            self.body_T_lidar = np.array(body2lidar_param, dtype=np.float32).reshape(4, 4)
+
         # I/O /onboard_detector/tracked_bboxes
-        rospy.Subscriber('/onboard_detector/dynamic_bboxes',
+        #rospy.Subscriber('/onboard_detector/dynamic_bboxes',
+        #                 MarkerArray, self._box_cb, queue_size=10)
+        rospy.Subscriber('/onboard_detector/filtered_bboxes',
                          MarkerArray, self._box_cb, queue_size=10)
-        # rospy.Subscriber('/onboard_detector/tracked_bboxes',
-        #                  MarkerArray, self._box_cb, queue_size=10)
         rospy.Subscriber('/livox/pcd',
                          PointCloud2, self._pcd_cb, queue_size=10)
 
@@ -126,14 +158,28 @@ class FinalBBoxCollector:
     # --------------------------------------------------------------------- #
 
     def _box_cb(self, msg: MarkerArray):
-        # boxes, objs = [], []
-        # for m in msg.markers:
-        #     cx, cy, cz = m.pose.position.x, m.pose.position.y, m.pose.position.z
-        #     w, l, h    = m.scale.x, m.scale.y, m.scale.z
-        #     q          = m.pose.orientation
-        #     _, _, yaw  = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        #     boxes.append([cx, cy, cz, w, l, h, yaw])
-        #     objs.append(BBox([cx, cy, cz], [w, l, h], yaw))
+        # If the incoming MarkerArray is not in the desired frame, pull TF once
+        if self.use_tf and msg.markers and msg.markers[0].header.frame_id != self.target_frame:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.target_frame,
+                    msg.markers[0].header.frame_id,
+                    msg.markers[0].header.stamp,
+                    rospy.Duration(0.1))
+                rot_q = np.array([tf.transform.rotation.x,
+                                  tf.transform.rotation.y,
+                                  tf.transform.rotation.z,
+                                  tf.transform.rotation.w], dtype=np.float32)
+                trans = np.array([tf.transform.translation.x,
+                                  tf.transform.translation.y,
+                                  tf.transform.translation.z], dtype=np.float32)
+            except (tf2_ros.LookupException,
+                    tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException):
+                rot_q, trans = None, None
+        else:
+            rot_q, trans = None, None
+
         boxes, objs = [], []
         for m in msg.markers:
             # Re-create absolute coordinates of the 8 unique vertices
@@ -156,8 +202,23 @@ class FinalBBoxCollector:
             l  = ymax - ymin
             h  = zmax - zmin
 
-            boxes.append([cx, cy, cz, w, l, h, 0.0])   # yaw = 0 (boxes are axis-aligned)
-            objs.append(BBox([cx, cy, cz], [w, l, h], 0.0))
+            # Estimate yaw from axis‑aligned rectangle in XY
+            dx = xmax - xmin
+            dy = ymax - ymin
+            yaw = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-3 else 0.0
+
+            # Transform centre into target frame if TF available
+            if rot_q is not None:
+                centre = np.array([cx, cy, cz], dtype=np.float32)
+                centre = R.from_quat(rot_q).apply(centre) + trans
+                cx, cy, cz = centre.tolist()
+            elif rot_q is None and self.static_tf_ok:
+                centre = np.array([cx, cy, cz], dtype=np.float32)
+                centre = R.from_quat(self.static_rot).apply(centre) + self.static_trans
+                cx, cy, cz = centre.tolist()
+
+            boxes.append([cx, cy, cz, w, l, h, yaw])
+            objs.append(BBox([cx, cy, cz], [w, l, h], yaw))
         with self.lock:
             self.latest_boxes_arr = np.asarray(boxes, dtype=np.float32) \
                                     if boxes else np.zeros((0, 7), np.float32)
@@ -175,29 +236,56 @@ class FinalBBoxCollector:
             boxes_arr = self.latest_boxes_arr.copy()
             boxes_obj = list(self.latest_boxes_obj)
 
+        # ---- Pose‑based map→lidar transform -----------------------------------
+        if self.body_T_lidar is not None and hasattr(self, "pose_list") and self.pose_list and self.frame_idx < len(self.pose_list):
+            world_T_body = self.pose_list[self.frame_idx]      # map==world frame
+            world_T_lidar = world_T_body @ self.body_T_lidar
+            lidar_T_world = np.linalg.inv(world_T_lidar)
+
+            for bi, bb in enumerate(boxes_obj):
+                hom = np.array([bb.center[0], bb.center[1], bb.center[2], 1.0], dtype=np.float32)
+                centre_lidar = lidar_T_world @ hom
+                boxes_arr[bi, :3] = centre_lidar[:3]
+                bb.center = centre_lidar[:3]
+
         # ---- Bring cloud into the same frame as the boxes ----------------------
-        if self.use_tf and pcd_msg.header.frame_id != 'map':
+        if self.use_tf and pcd_msg.header.frame_id != self.target_frame:
             try:
                 tf = self.tf_buffer.lookup_transform(
-                    'map',                           # target
-                    pcd_msg.header.frame_id,         # source
-                    rospy.Time(0),                   # latest
+                    self.target_frame,
+                    pcd_msg.header.frame_id,
+                    rospy.Time(0),
                     rospy.Duration(0.1))
-                cloud_map = tf2_sns.do_transform_cloud(pcd_msg, tf)
+                cloud_tf = tf2_sns.do_transform_cloud(pcd_msg, tf)
             except (tf2_ros.LookupException,
                     tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException):
-                # Fall back to raw cloud instead of skipping
                 rospy.logwarn_once(
-                    "[data_collector] No TF to 'map'; using raw cloud frame (%s). "
-                    "Masks may be mis-aligned.", pcd_msg.header.frame_id)
-                cloud_map = pcd_msg
+                    "[data_collector] TF to '%s' unavailable; using raw cloud frame (%s). "
+                    "Masks may be mis‑aligned.",
+                    self.target_frame, pcd_msg.header.frame_id)
+                if self.static_tf_ok:
+                    cloud_tf = tf2_sns.do_transform_cloud(
+                        pcd_msg,
+                        TransformStamped(
+                            transform=Transform(
+                                translation=Vector3(
+                                    x=float(self.static_trans[0]),
+                                    y=float(self.static_trans[1]),
+                                    z=float(self.static_trans[2])),
+                                rotation=Quaternion(
+                                    x=float(self.static_rot[0]),
+                                    y=float(self.static_rot[1]),
+                                    z=float(self.static_rot[2]),
+                                    w=float(self.static_rot[3])))),
+                    )
+                else:
+                    cloud_tf = pcd_msg
         else:
-            # Either TF disabled or already in map frame
-            cloud_map = pcd_msg
+            cloud_tf = pcd_msg
 
         # Extract xyz in map frame
-        pts = np.array([p for p in pc2.read_points(cloud_map,
+        pts = np.array([p for p in pc2.read_points(cloud_tf,
                                                    skip_nans=True,
                                                    field_names=('x', 'y', 'z'))],
                        dtype=np.float32)
@@ -229,6 +317,43 @@ class FinalBBoxCollector:
         os.makedirs(self.bbox_dir, exist_ok=True)
         os.makedirs(self.mask_dir,  exist_ok=True)
         rospy.loginfo(f"Output directories ready:\n  {self.bbox_dir}\n  {self.mask_dir}")
+
+        # ------------------------------------------------------------------
+        # JRDB pose files come in two flavors:
+        #   <seq>_poses_kitti.txt  – 12 floats (3×4 row-major) per line
+        #   <seq>_poses_tum.txt    – t x y z qx qy qz qw  (timestamp + pose)
+        # We search for either file and build a list[4×4] world→body matrices.
+        # ------------------------------------------------------------------
+        
+        pose_base = f'/scratch/aadith_warrier/JRDB/poses/{seq}'
+        kitti_file = pose_base + '_poses_kitti.txt'
+        tum_file   = pose_base + '_poses_tum.txt'
+        self.pose_list = []
+
+        if os.path.exists(kitti_file):
+            with open(kitti_file) as f:
+                for line in f:
+                    vals = [float(v) for v in line.strip().split()]
+                    if len(vals) != 12:
+                        continue
+                    mat = np.eye(4, dtype=np.float32)
+                    mat[:3, :4] = np.array(vals, dtype=np.float32).reshape(3, 4)
+                    self.pose_list.append(mat)
+
+        elif os.path.exists(tum_file):
+            with open(tum_file) as f:
+                for line in f:
+                    vals = [float(v) for v in line.strip().split()]
+                    if len(vals) != 8:
+                        continue
+                    _, x, y, z, qx, qy, qz, qw = vals
+                    R_wb = Rsci.from_quat([qx, qy, qz, qw]).as_matrix()
+                    mat = np.eye(4, dtype=np.float32)
+                    mat[:3, :3] = R_wb
+                    mat[:3, 3]  = [x, y, z]
+                    self.pose_list.append(mat)
+
+        rospy.loginfo(f"[collector] Loaded {len(self.pose_list)} poses for {seq}")
 
 
 # --------------------------------------------------------------------------- #

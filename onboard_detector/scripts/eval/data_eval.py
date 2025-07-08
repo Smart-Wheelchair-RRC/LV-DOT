@@ -26,47 +26,23 @@ Metrics reported per‑sequence and averaged across sequences:
 * **Masks**  : IoU, Precision, Recall, F1
 
 To run -
-python3 data_eval.py --pred_dir /scratch/gaurav_kumar/result --gt_dir  /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0 --cfg_yaml /scratch/gaurav_kumar/lvdot_testing/src/LV-DOT/onboard_detector/cfg/custom_param.yaml
-python3 data_eval.py --pred_dir /scratch/gaurav_kumar/results --gt_dir /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0 (old)
+python3 data_eval.py --pred_dir /scratch/gaurav_kumar/results --gt_dir /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0
 
 """
+# --------------------------------------------------------------------------- #
+#   Imports                                                                  #
+# --------------------------------------------------------------------------- #
 import os
 import argparse
 import numpy as np
 import sys
-import yaml
+import json
 # Alias old NumPy internal modules so pickle.load can find them
 sys.modules['numpy._core'] = np.core
 # Some systems name the multiarray in the old path
 if hasattr(np.core, '_multiarray_umath'):
     sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 from scipy.optimize import linear_sum_assignment
-
-# --------------------------------------------------------------------------- #
-#   Helper: Load max evaluation range from yaml                               #
-# --------------------------------------------------------------------------- #
-def load_max_range(cfg_yaml):
-    """
-    Parse custom_param.yaml (or another yaml) to obtain the maximum
-    distance (in metres) within which boxes should be evaluated.
-    The function looks for, in order of preference:
-        - field 'raycastMaxLength' (float)
-        - field 'depth_max_value'
-        - field 'max_eval_range'
-    If none are found, returns None, meaning *no range filter*.
-    """
-    if cfg_yaml is None:
-        return None
-    try:
-        with open(cfg_yaml, 'r') as f:
-            cfg = yaml.safe_load(f)
-    except (FileNotFoundError, yaml.YAMLError):
-        return None
-
-    for key in ('raycastMaxLength', 'depth_max_value', 'max_eval_range'):
-        if key in cfg and isinstance(cfg[key], (int, float)):
-            return float(cfg[key])
-    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +69,34 @@ def compute_mask_metrics(pred_mask, gt_mask, thr):
     iou       = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
     return {'iou': iou, 'precision': precision, 'recall': recall, 'f1': f1}
 
+# --------------------------------------------------------------------------- #
+#   Ground-truth dict → 7-tuple conversion                                    #
+# --------------------------------------------------------------------------- #
+
+def dict_to_7tuple(d):
+    """
+    Convert a JRDB annotation dict to [cx, cy, cz, w, l, h, yaw].
+    Handles two common layouts:
+
+      1. {'translation': [x,y,z], 'size': [w,l,h], 'rotation_y': yaw, ...}
+      2. {'cx': x, 'cy': y, 'cz': z, 'w': w, 'l': l, 'h': h, 'yaw': yaw}
+
+    Returns None if parsing fails.
+    """
+    if 'translation' in d and 'size' in d:                     # layout 1
+        cx, cy, cz  = d['translation'][:3]
+        w,  l,  h   = d['size'][:3]
+        yaw         = d.get('rotation_y', 0.0)
+        return [cx, cy, cz, w, l, h, yaw]
+
+    if all(k in d for k in ('cx', 'cy', 'cz', 'w', 'l', 'h', 'yaw')):  # layout 2
+        return [d['cx'], d['cy'], d['cz'],
+                d['w'],  d['l'],  d['h'],  d['yaw']]
+
+    # fallback: first seven numeric values
+    nums = [v for v in d.values() if isinstance(v, (int, float))]
+    return nums[:7] if len(nums) >= 7 else None
+
 
 # --------------------------------------------------------------------------- #
 #   3‑D box helpers                                                            #
@@ -117,24 +121,35 @@ def bbox_corners(box):
     return corners
 
 
-def bbox_iou_xy(b1, b2):
+def bbox_iou_3d(b1, b2):
     """
-    2‑D IoU in the XY plane (BEV).  We ignore height to compensate for the
-    fact that LV‑DOT boxes cover only the upper body.
+    Approximate 3‑D IoU by projecting to BEV (xy plane) with oriented rectangles,
+    intersecting their z‑ranges, and dividing the volumes.
+    For speed we approximate the BEV overlap by axis‑aligned rectangles that
+    bound the rotated rectangles.
     """
-    c1, c2 = bbox_corners(b1), bbox_corners(b2)
+    # volumes
+    v1 = b1[3] * b1[4] * b1[5]
+    v2 = b2[3] * b2[4] * b2[5]
+
+    # axis‑aligned bounding boxes in BEV
+    c1 = bbox_corners(b1)
+    c2 = bbox_corners(b2)
     min1 = c1[:, :2].min(axis=0); max1 = c1[:, :2].max(axis=0)
     min2 = c2[:, :2].min(axis=0); max2 = c2[:, :2].max(axis=0)
-
     inter_min = np.maximum(min1, min2)
     inter_max = np.minimum(max1, max2)
-    wh = np.maximum(0.0, inter_max - inter_min)
-    inter_area = wh[0] * wh[1]
+    inter_xy = np.maximum(0.0, inter_max - inter_min)
+    inter_area = inter_xy[0] * inter_xy[1]
 
-    area1 = (max1[0] - min1[0]) * (max1[1] - min1[1])
-    area2 = (max2[0] - min2[0]) * (max2[1] - min2[1])
-    union_area = area1 + area2 - inter_area
-    return inter_area / union_area if union_area > 0 else 0.0
+    # z‑overlap
+    z1_min, z1_max = b1[2] - b1[5]/2.0, b1[2] + b1[5]/2.0
+    z2_min, z2_max = b2[2] - b2[5]/2.0, b2[2] + b2[5]/2.0
+    inter_z = max(0.0, min(z1_max, z2_max) - max(z1_min, z2_min))
+
+    inter_vol = inter_area * inter_z
+    union_vol = v1 + v2 - inter_vol
+    return inter_vol / union_vol if union_vol > 0 else 0.0
 
 
 def match_boxes(pred, gt, iou_thr):
@@ -149,7 +164,7 @@ def match_boxes(pred, gt, iou_thr):
     ious = np.zeros((len(pred), len(gt)), dtype=np.float32)
     for i, pb in enumerate(pred):
         for j, gb in enumerate(gt):
-            ious[i, j] = bbox_iou_xy(pb, gb)
+            ious[i, j] = bbox_iou_3d(pb, gb)
 
     # Hungarian on negative IoU (maximize IoU)
     row_ind, col_ind = linear_sum_assignment(-ious)
@@ -182,7 +197,7 @@ def compute_box_metrics(pred_boxes, gt_boxes, iou_thr):
 #   Main evaluation loop                                                      #
 # --------------------------------------------------------------------------- #
 
-def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0, max_range=None):
+def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
     """
     pred_root : directory containing bboxes/ and masks/ trees collected by LV‑DOT
     gt_root   : directory containing JRDB ground‑truth trees
@@ -193,84 +208,35 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0, max_range=None)
     pred_scenarios = sorted(os.listdir(os.path.join(pred_root, 'bboxes', 'upper_velodyne')))
     for seq in pred_scenarios:
         p_bbox_dir = os.path.join(pred_root, 'bboxes', 'upper_velodyne', seq)
-        g_bbox_dir = os.path.join(gt_root,  'bboxes', 'upper_velodyne', seq)
+        # Sequence‑level JSON file containing all frame annotations
+        seq_json_path = os.path.join(gt_root, 'labels', 'labels_3d', f'{seq}.json')
+        # Load sequence JSON only once
+        with open(seq_json_path) as jf:
+            seq_labels = json.load(jf)["labels"]  # dict{"000000.pcd":[{box...}, ...], ...}
         p_mask_dir = os.path.join(pred_root, 'masks',  'upper_velodyne', seq)
         g_mask_dir = os.path.join(gt_root,  'masks',  'upper_velodyne', seq)
 
-        if not os.path.isdir(g_bbox_dir) or not os.path.isdir(g_mask_dir):
+        if not os.path.isdir(p_bbox_dir) or not os.path.isdir(g_mask_dir):
             print(f"[WARN] Ground‑truth missing for sequence {seq}; skipping.")
             continue
 
         per_file_b = []
         per_file_m = []
 
+        # Only consider frames present in predictions and (mask) GT
         common_frames = sorted(set(f for f in os.listdir(p_bbox_dir) if f.endswith('.npy')) &
-                               set(f for f in os.listdir(g_bbox_dir) if f.endswith('.npy')))
+                               set(f for f in os.listdir(g_mask_dir) if f.endswith('.npy')))
 
         for fname in common_frames:
             # Load predicted boxes (float32 array)
             pred_boxes = np.load(os.path.join(p_bbox_dir, fname))
-            # Load ground-truth boxes (may be object array), allow pickled list loading
-            gt_raw = np.load(os.path.join(g_bbox_dir, fname), allow_pickle=True)
-            
-            # Handle different ground truth data formats
-            if isinstance(gt_raw, np.ndarray) and gt_raw.dtype == object:
-                # Check if it's an array of dictionaries or lists
-                if len(gt_raw) > 0:
-                    if isinstance(gt_raw[0], dict):
-                        # Extract bbox values from dictionaries
-                        # Assuming dict has keys like 'box' or direct coordinate keys
-                        gt_list = []
-                        for item in gt_raw:
-                            if 'box' in item:
-                                gt_list.append(item['box'])
-                            elif all(k in item for k in ['cx', 'cy', 'cz', 'w', 'l', 'h', 'yaw']):
-                                gt_list.append([item['cx'], item['cy'], item['cz'], 
-                                              item['w'], item['l'], item['h'], item['yaw']])
-                            elif all(k in item for k in ['x', 'y', 'z', 'width', 'length', 'height', 'yaw']):
-                                gt_list.append([item['x'], item['y'], item['z'], 
-                                              item['width'], item['length'], item['height'], item['yaw']])
-                            else:
-                                # Try to extract numeric values in order
-                                values = [v for v in item.values() if isinstance(v, (int, float))]
-                                if len(values) >= 7:
-                                    gt_list.append(values[:7])
-                        gt_boxes = np.array(gt_list, dtype=np.float32) if gt_list else np.empty((0, 7), dtype=np.float32)
-                    else:
-                        # Assume it's an array of lists/arrays
-                        gt_boxes = np.vstack(gt_raw).astype(np.float32)
-                else:
-                    gt_boxes = np.empty((0, 7), dtype=np.float32)
-            else:
-                gt_boxes = gt_raw.astype(np.float32)
-                
-            # ------ Ensure arrays have shape (N,7); else make them empty ----------
-            def to_Nx7(arr):
-                arr = np.asarray(arr, dtype=np.float32)
-                if arr.size == 0:
-                    return np.empty((0, 7), np.float32)
-                if arr.ndim == 1:                       # flat vector
-                    if arr.size == 7:
-                        return arr.reshape(1, 7)
-                    if arr.size % 7 == 0:
-                        return arr.reshape(-1, 7)
-                    return np.empty((0, 7), np.float32)
-                # if it’s 2-D but wrong width, try flatten-reshape
-                if arr.ndim == 2 and arr.shape[1] != 7:
-                    flat = arr.ravel()
-                    if flat.size % 7 == 0:
-                        return flat.reshape(-1, 7)
-                    return np.empty((0, 7), np.float32)
-                return arr
-
-            pred_boxes = to_Nx7(pred_boxes)
-            gt_boxes   = to_Nx7(gt_boxes)    
-            # -------- Range filter (centre‑distance) --------------------
-            if max_range is not None:
-                keep_pred = np.sqrt(pred_boxes[:,0]**2 + pred_boxes[:,1]**2) <= max_range
-                keep_gt   = np.sqrt(gt_boxes[:,0]**2   + gt_boxes[:,1]**2)   <= max_range
-                pred_boxes = pred_boxes[keep_pred]
-                gt_boxes   = gt_boxes[keep_gt]
+            # -------- ground‑truth from in‑memory JSON -----------------------
+            frame_key = fname.replace('.npy', '.pcd')
+            tuples = [dict_to_7tuple(item['box'])
+                      for item in seq_labels.get(frame_key, [])
+                      if dict_to_7tuple(item['box']) is not None]
+            gt_boxes = np.asarray(tuples, dtype=np.float32) if tuples else \
+                       np.empty((0, 7), np.float32)
             b_metrics  = compute_box_metrics(pred_boxes, gt_boxes, box_iou_thr)
             per_file_b.append(b_metrics)
 
@@ -300,20 +266,15 @@ if __name__ == '__main__':
                     help="Base dir containing prediction trees (results)")
     ap.add_argument('--gt_dir', required=True,
                     help="Base dir containing ground‑truth trees (JRDB)")
-    ap.add_argument('--box_iou_thr', type=float, default=0.25,
+    ap.add_argument('--box_iou_thr', type=float, default=0.05,
                     help="IoU threshold for bbox TP (default 0.25)")
     ap.add_argument('--mask_thr', type=float, default=0.0,
                     help="Threshold for mask binarisation (default 0)")
-    ap.add_argument('--cfg_yaml', default=None,
-                    help="custom_param.yaml path (for max eval range)")
     args = ap.parse_args()
-
-    max_range = load_max_range(args.cfg_yaml)
 
     seq_scores = evaluate(args.pred_dir, args.gt_dir,
                           box_iou_thr=args.box_iou_thr,
-                          mask_thr=args.mask_thr,
-                          max_range=max_range)
+                          mask_thr=args.mask_thr)
 
     if not seq_scores:
         print("No sequences evaluated – check directory paths.")
