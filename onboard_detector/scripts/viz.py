@@ -71,6 +71,7 @@ def visualize_mask_sequence(
         
     rr.init("mask_sequence_vis", recording_id=recording_id)
     rr.connect_tcp("127.0.0.1:9876")
+    # rr.connect_tcp("10.2.135.228:9090")
     rr.spawn()  # Launch viewer if not already running
 
     mask_files = sorted(glob.glob(os.path.join(mask_dir, "*.npy")))

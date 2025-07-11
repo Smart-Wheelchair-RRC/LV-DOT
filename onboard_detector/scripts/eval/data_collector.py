@@ -9,6 +9,9 @@ Subscribed Topics
 /onboard_detector/tracked_bboxes     visualization_msgs/MarkerArray
 /livox/pcd                          sensor_msgs/PointCloud2
 
++ /onboard_detector/tracked_bboxes
++ /onboard_detector/raw_dynamic_point_cloud
+
 Usage
 -----
 rosrun onboard_detector data_collector.py 
@@ -142,11 +145,11 @@ class FinalBBoxCollector:
             self.body_T_lidar = np.array(body2lidar_param, dtype=np.float32).reshape(4, 4)
 
         # I/O /onboard_detector/tracked_bboxes
-        #rospy.Subscriber('/onboard_detector/dynamic_bboxes',
-        #                 MarkerArray, self._box_cb, queue_size=10)
-        rospy.Subscriber('/onboard_detector/filtered_bboxes',
-                         MarkerArray, self._box_cb, queue_size=10)
-        rospy.Subscriber('/livox/pcd',
+        rospy.Subscriber('/onboard_detector/dynamic_bboxes',
+                        MarkerArray, self._box_cb, queue_size=10)
+        # rospy.Subscriber('/onboard_detector/tracked_bboxes',
+        #                  MarkerArray, self._box_cb, queue_size=10)
+        rospy.Subscriber('/onboard_detector/raw_dynamic_point_cloud',
                          PointCloud2, self._pcd_cb, queue_size=10)
 
         if self.sequence:
@@ -203,9 +206,18 @@ class FinalBBoxCollector:
             h  = zmax - zmin
 
             # Estimate yaw from axis‑aligned rectangle in XY
-            dx = xmax - xmin
-            dy = ymax - ymin
-            yaw = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-3 else 0.0
+            # dx = xmax - xmin
+            # dy = ymax - ymin
+            # yaw = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-3 else 0.0
+
+            # Yaw: prefer quaternion from marker pose (z‑axis rotation)
+            q = m.pose.orientation
+            yaw = 2.0 * np.arctan2(q.z, q.w)
+            # Fallback to dx/dy heuristic if quaternion invalid
+            if np.isnan(yaw) or abs(q.w) < 1e-4:
+                dx = xmax - xmin
+                dy = ymax - ymin
+                yaw = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-3 else 0.0
 
             # Transform centre into target frame if TF available
             if rot_q is not None:

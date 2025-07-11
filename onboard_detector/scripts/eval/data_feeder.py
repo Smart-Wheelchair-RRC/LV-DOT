@@ -11,6 +11,7 @@ Publishes
 /yolo_detector/detected_bounding_boxes vision_msgs/Detection2DArray
 """
 import os, json, cv2, rospy, numpy as np, open3d as o3d
+import sys, select, tty, termios         # non-blocking keyboard control
 import sensor_msgs.point_cloud2 as pc2
 from cv_bridge import CvBridge
 from std_msgs.msg import Header
@@ -103,61 +104,100 @@ class JRDBDataFeeder:
         self.pub_odom  = rospy.Publisher('/localization', Odometry,        queue_size=5)
         self.pub_boxes = rospy.Publisher('/yolo_detector/detected_bounding_boxes',
                                          Detection2DArray,                 queue_size=5)
+        
+        # ----- keyboard: cbreak mode ----------------------------------------
+        self._fd        = sys.stdin.fileno()
+        self._old_term  = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        rospy.on_shutdown(self._restore_terminal)
 
+        # Keep a reference so we can iterate
+        self.seq_list = seq_list
+
+        # ------------------------------------------------------------------
+        # Main publish loop over sequences and frames
+        # ------------------------------------------------------------------
         try:
-            for seq in seq_list:
+            for seq in self.seq_list:
                 if rospy.is_shutdown():
                     break
-                # broadcast current sequence so collectors can pick it up
+                # broadcast current sequence
                 rospy.set_param('/current_sequence', seq)
                 ds = JRDBDataset(root, seq, cam)
                 rospy.loginfo(f'▶ Feeding sequence {seq} ({len(ds)} frames)')
-                for i, sample in enumerate(ds):
-                    if rospy.is_shutdown():
-                        break
-                    t = rospy.Time.now()
-                    hdr = Header(stamp=t, frame_id='camera_link', seq=i)
+                frame_idx = 0
+                while frame_idx < len(ds) and not rospy.is_shutdown():
+                    sample = ds[frame_idx]
+                    t   = rospy.Time.now()
+                    hdr = Header(stamp=t, frame_id='camera_link', seq=frame_idx)
 
-                    # -- RGB image --
-                    rgb_msg = self.bridge.cv2_to_imgmsg(sample['image'], encoding='rgb8')
+                    # --- publish RGB ---
+                    rgb_msg = self.bridge.cv2_to_imgmsg(sample["image"], encoding='rgb8')
                     rgb_msg.header = hdr
                     self.pub_rgb.publish(rgb_msg)
 
-                    # -- Depth --
-                    d_msg = self.bridge.cv2_to_imgmsg(sample['depth'], encoding='16UC1')
+                    # --- publish Depth ---
+                    d_msg = self.bridge.cv2_to_imgmsg(sample["depth"], encoding='16UC1')
                     d_msg.header = hdr
                     self.pub_depth.publish(d_msg)
 
-                    # -- PointCloud2 --
-                    xyz = sample['points']
+                    # --- publish PointCloud ---
+                    xyz = sample["points"]
                     pts_np = np.zeros(xyz.shape[0], dtype=[
                         ('x',np.float32),('y',np.float32),('z',np.float32),('intensity',np.float32)])
                     pts_np['x'], pts_np['y'], pts_np['z'] = xyz.T
-                    cloud_msg = pc2.create_cloud(Header(stamp=t, frame_id='upper_velodyne', seq=i),
-                                                 [ pc2.PointField(n,off,pc2.PointField.FLOAT32,1)
-                                                   for n,off in zip(('x','y','z','intensity'), (0,4,8,12)) ],
-                                                 pts_np)
+                    cloud_msg = pc2.create_cloud(
+                        Header(stamp=t, frame_id='upper_velodyne', seq=frame_idx),
+                        [pc2.PointField(n,off,pc2.PointField.FLOAT32,1)
+                         for n,off in zip(('x','y','z','intensity'), (0,4,8,12))],
+                        pts_np)
                     self.pub_pcd.publish(cloud_msg)
 
-                    # -- Static odometry (identity) --
+                    # --- publish Odometry (identity) ---
                     odom = Odometry()
-                    odom.header = Header(stamp=t, frame_id='base_link', seq=i)
+                    odom.header = Header(stamp=t, frame_id='base_link', seq=frame_idx)
                     odom.child_frame_id = 'base_link'
                     odom.pose.pose = Pose()
                     odom.pose.pose.orientation = GeoQuat(0,0,0,1)
-                    odom.twist.twist = Twist()
                     self.pub_odom.publish(odom)
 
-                    # -- 2-D bounding boxes --
-                    self.pub_boxes.publish(boxes_to_detection_array(sample['boxes'], t, 'camera_link'))
+                    # --- publish 2‑D detections ---
+                    self.pub_boxes.publish(
+                        boxes_to_detection_array(sample['boxes'], t, 'camera_link'))
 
                     self.rate.sleep()
+
+                    # --- keyboard control ---
+                    key = self._key_pressed()
+                    if key in ('q', 'Q'):
+                        rospy.loginfo('Quit requested — shutting down feeder.')
+                        rospy.signal_shutdown('User quit')
+                        break
+                    elif key in ('n', 'N'):
+                        rospy.loginfo('▶ Skipping to next sequence (key n)')
+                        break
+                    elif key in ('r', 'R'):
+                        rospy.loginfo('↺ Replaying current sequence (key r)')
+                        frame_idx = 0
+                        continue
+
+                    frame_idx += 1
+        except (rospy.ROSInterruptException, KeyboardInterrupt):
+            rospy.loginfo('Feeder shutdown requested.')
+        finally:
             rospy.loginfo('✔ All sequences done; shutting down.')
             rospy.signal_shutdown('Finished all sequences.')
-        except (rospy.ROSInterruptException, KeyboardInterrupt):
-            rospy.loginfo('Feeder shutdown requested. Exiting.')
-            rospy.signal_shutdown('Ctrl‑C pressed')
-            return
+
+    # ---------------------------------------------------------------------
+    #   keyboard helpers
+    # ---------------------------------------------------------------------
+    def _key_pressed(self):
+        """Return a single char if a key was hit, else None (non-blocking)."""
+        dr, _, _ = select.select([sys.stdin], [], [], 0)
+        return sys.stdin.read(1) if dr else None
+
+    def _restore_terminal(self):
+        termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_term)
 
 # ---------------------------------------------------------------------------
 

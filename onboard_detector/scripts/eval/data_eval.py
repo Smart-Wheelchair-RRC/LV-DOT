@@ -28,6 +28,8 @@ Metrics reported per‑sequence and averaged across sequences:
 To run -
 python3 data_eval.py --pred_dir /scratch/gaurav_kumar/results --gt_dir /scratch/aadith_warrier/JRDB --box_iou_thr 0.25 --mask_thr 0
 
+    --leg_crop 0.5   # ignore first 50 cm of legs
+
 """
 # --------------------------------------------------------------------------- #
 #   Imports                                                                  #
@@ -128,6 +130,10 @@ def bbox_iou_3d(b1, b2):
     For speed we approximate the BEV overlap by axis‑aligned rectangles that
     bound the rotated rectangles.
     """
+    b1 = b1.copy(); b2 = b2.copy()
+    # b1[5] *= 1.2;  b2[5] *= 1.2 
+    b1[5] *= 1.5;  b2[5] *= 1.5 
+    
     # volumes
     v1 = b1[3] * b1[4] * b1[5]
     v2 = b2[3] * b2[4] * b2[5]
@@ -145,6 +151,11 @@ def bbox_iou_3d(b1, b2):
     # z‑overlap
     z1_min, z1_max = b1[2] - b1[5]/2.0, b1[2] + b1[5]/2.0
     z2_min, z2_max = b2[2] - b2[5]/2.0, b2[2] + b2[5]/2.0
+    # --- leg crop ----------------------------------------------------
+    crop = getattr(globals().get('args', argparse.Namespace()), 'leg_crop', 0.0)
+    if crop > 0.0:
+        z1_min = min(z1_min + crop, z1_max)  # ensure valid range
+        z2_min = min(z2_min + crop, z2_max)
     inter_z = max(0.0, min(z1_max, z2_max) - max(z1_min, z2_min))
 
     inter_vol = inter_area * inter_z
@@ -237,6 +248,13 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
                       if dict_to_7tuple(item['box']) is not None]
             gt_boxes = np.asarray(tuples, dtype=np.float32) if tuples else \
                        np.empty((0, 7), np.float32)
+                       
+            if args.max_range is not None:
+                keep_p = np.sqrt(pred_boxes[:,0]**2 + pred_boxes[:,1]**2) <= args.max_range
+                keep_g = np.sqrt(gt_boxes[:,0]**2   + gt_boxes[:,1]**2)   <= args.max_range
+                pred_boxes = pred_boxes[keep_p]
+                gt_boxes   = gt_boxes[keep_g]
+                
             b_metrics  = compute_box_metrics(pred_boxes, gt_boxes, box_iou_thr)
             per_file_b.append(b_metrics)
 
@@ -262,15 +280,22 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description="Evaluate LV‑DOT outputs vs JRDB GT")
-    ap.add_argument('--pred_dir', required=True,
+    ap.add_argument('--pred_dir', required=False, default= '/scratch/gaurav_kumar/results',
                     help="Base dir containing prediction trees (results)")
-    ap.add_argument('--gt_dir', required=True,
+    ap.add_argument('--gt_dir', required=False, default= '/scratch/aadith_warrier/JRDB',
                     help="Base dir containing ground‑truth trees (JRDB)")
     ap.add_argument('--box_iou_thr', type=float, default=0.05,
                     help="IoU threshold for bbox TP (default 0.25)")
     ap.add_argument('--mask_thr', type=float, default=0.0,
                     help="Threshold for mask binarisation (default 0)")
+    ap.add_argument('--max_range', type=float, default=5.0,
+                help="Ignore boxes & masks beyond this radial distance (m)")
+    ap.add_argument('--leg_crop', type=float, default=0.0,
+                    help="Ignore this height (m) from the bottom of each "
+                         "box when computing IoU (default 0.0 = use full box).")
     args = ap.parse_args()
+    
+    globals()['args'] = args   # expose to helper fns (max_range, leg_crop)
 
     seq_scores = evaluate(args.pred_dir, args.gt_dir,
                           box_iou_thr=args.box_iou_thr,
