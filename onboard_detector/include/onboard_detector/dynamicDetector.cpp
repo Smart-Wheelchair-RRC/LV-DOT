@@ -287,8 +287,8 @@ void dynamicDetector::initParam()
   // ground height
   if (not this->nh_.getParam(this->ns_ + "/ground_height", this->groundHeight_))
   {
-    this->groundHeight_ = 0.1;
-    std::cout << this->hint_ << ": No ground height parameter. Use default: 0.1m." << std::endl;
+    this->groundHeight_ = 0.0;
+    std::cout << this->hint_ << ": No ground height parameter. Use default: 0.0m." << std::endl;
   }
   else
   {
@@ -322,8 +322,8 @@ void dynamicDetector::initParam()
   // minimum number of points in each cluster
   if (not this->nh_.getParam(this->ns_ + "/dbscan_min_points_cluster", this->dbMinPointsCluster_))
   {
-    this->dbMinPointsCluster_ = 18;
-    cout << this->hint_ << ": No DBSCAN minimum point in each cluster parameter. Use default: 18." << endl;
+    this->dbMinPointsCluster_ = 10;
+    cout << this->hint_ << ": No DBSCAN minimum point in each cluster parameter. Use default: 10." << endl;
   }
   else
   {

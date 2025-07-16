@@ -39,6 +39,7 @@ import sensor_msgs.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation as R
 
 from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import Marker
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion
 from scipy.spatial.transform import Rotation as Rsci
@@ -103,6 +104,16 @@ class FinalBBoxCollector:
         self.results_base = rospy.get_param('~results_dir',
                                             '/scratch/gaurav_kumar/results')
         self.sequence     = rospy.get_param('~sequence', None)
+        
+                # ------------------------------------------------------------------
+        #   Bounding-box post-scaling (tune predicted boxes to GT size)
+        # ------------------------------------------------------------------
+        # Uniform lateral scale applied to width & length (default 1.30 ≈ torso → full-body)
+        self.bbox_scale_xy = rospy.get_param('~bbox_scale_xy', 1.30)
+        # Vertical scale applied to height (default 1.10)
+        self.bbox_scale_z  = rospy.get_param('~bbox_scale_z', 1.20)
+        # Minimum dimensions [w, l, h] enforced after scaling
+        self.bbox_min_dims = rospy.get_param('~bbox_min_dims', [0.50, 0.50, 1.50])
 
         # --- TF / frame config -------------------------------------------------
         # Whether to transform data at all
@@ -149,7 +160,7 @@ class FinalBBoxCollector:
                         MarkerArray, self._box_cb, queue_size=10)
         # rospy.Subscriber('/onboard_detector/tracked_bboxes',
         #                  MarkerArray, self._box_cb, queue_size=10)
-        rospy.Subscriber('/onboard_detector/raw_dynamic_point_cloud',
+        rospy.Subscriber('/livox/pcd',
                          PointCloud2, self._pcd_cb, queue_size=10)
 
         if self.sequence:
@@ -185,51 +196,66 @@ class FinalBBoxCollector:
 
         boxes, objs = [], []
         for m in msg.markers:
-            # Re-create absolute coordinates of the 8 unique vertices
-            abs_pts = [(m.pose.position.x + p.x,
-                        m.pose.position.y + p.y,
-                        m.pose.position.z + p.z) for p in m.points]
-
-            if not abs_pts:                 # Safety guard
-                continue
-
-            xs, ys, zs = zip(*abs_pts)
-            xmin, xmax = min(xs), max(xs)
-            ymin, ymax = min(ys), max(ys)
-            zmin, zmax = min(zs), max(zs)
-
-            cx = (xmin + xmax) / 2.0
-            cy = (ymin + ymax) / 2.0
-            cz = (zmin + zmax) / 2.0
-            w  = xmax - xmin
-            l  = ymax - ymin
-            h  = zmax - zmin
-
-            # Estimate yaw from axis‑aligned rectangle in XY
-            # dx = xmax - xmin
-            # dy = ymax - ymin
-            # yaw = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-3 else 0.0
-
-            # Yaw: prefer quaternion from marker pose (z‑axis rotation)
+            # ------------------------------------------------------------------
+            # 1. World-space vertex positions
+            # ------------------------------------------------------------------
             q = m.pose.orientation
-            yaw = 2.0 * np.arctan2(q.z, q.w)
-            # Fallback to dx/dy heuristic if quaternion invalid
-            if np.isnan(yaw) or abs(q.w) < 1e-4:
-                dx = xmax - xmin
-                dy = ymax - ymin
-                yaw = np.arctan2(dy, dx) if (abs(dx) + abs(dy)) > 1e-3 else 0.0
+            rot_mat = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()  # 3×3
+            verts = []
+            for p in m.points:
+                local = np.array([p.x, p.y, p.z], dtype=np.float32)
+                verts.append(rot_mat @ local +
+                             np.array([m.pose.position.x,
+                                       m.pose.position.y,
+                                       m.pose.position.z], dtype=np.float32))
+            if not verts:
+                continue
+            V = np.stack(verts)          # (N, 3)
+            # ------------------------------------------------------------------
+            # 2. Derive [cx, cy, cz, w, l, h, yaw]
+            # ------------------------------------------------------------------
+            centre = V.mean(axis=0)
 
-            # Transform centre into target frame if TF available
+            # Robust yaw extraction (works even if roll/pitch ≠ 0)
+            yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('zyx', degrees=False)[0]
+
+            # Prefer explicit dimensions in the Marker message when present
+            if m.scale.x > 0.0 and m.scale.y > 0.0 and m.scale.z > 0.0:
+                # JRDB convention: [width, length, height] = (scale.x, scale.y, scale.z)
+                w, l, h = m.scale.x, m.scale.y, m.scale.z
+            else:
+                # Fallback – deduce extents from the 8 vertices
+                Rz = np.array([[ np.cos(-yaw), -np.sin(-yaw), 0],
+                               [ np.sin(-yaw),  np.cos(-yaw), 0],
+                               [          0.0,           0.0, 1]], dtype=np.float32)
+                V_local = (Rz @ (V - centre).T).T
+                w = V_local[:, 0].ptp()
+                l = V_local[:, 1].ptp()
+                h = V_local[:, 2].ptp()
+                        # ------------------------------------------------------------------
+            # 2b.  Scale and clamp so predicted boxes match JRDB GT dimensions
+            # ------------------------------------------------------------------
+            w *= self.bbox_scale_xy
+            l *= self.bbox_scale_xy
+            h *= self.bbox_scale_z
+            # Enforce minimum “full-body” size
+            w = max(w, self.bbox_min_dims[0])
+            l = max(l, self.bbox_min_dims[1])
+            h = max(h, self.bbox_min_dims[2])
+
+            # ------------------------------------------------------------------
+            # 3. Optional transform into target_frame
+            # ------------------------------------------------------------------
             if rot_q is not None:
-                centre = np.array([cx, cy, cz], dtype=np.float32)
                 centre = R.from_quat(rot_q).apply(centre) + trans
-                cx, cy, cz = centre.tolist()
-            elif rot_q is None and self.static_tf_ok:
-                centre = np.array([cx, cy, cz], dtype=np.float32)
+            elif self.static_tf_ok:
                 centre = R.from_quat(self.static_rot).apply(centre) + self.static_trans
-                cx, cy, cz = centre.tolist()
 
+            cx, cy, cz = centre.tolist()
             boxes.append([cx, cy, cz, w, l, h, yaw])
+            # Slight inflation (5 %) so thin boxes still capture upper‑body points
+            boxes[-1][3] *= 1.05
+            boxes[-1][4] *= 1.05
             objs.append(BBox([cx, cy, cz], [w, l, h], yaw))
         with self.lock:
             self.latest_boxes_arr = np.asarray(boxes, dtype=np.float32) \

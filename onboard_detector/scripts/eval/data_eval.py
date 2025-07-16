@@ -46,6 +46,8 @@ if hasattr(np.core, '_multiarray_umath'):
     sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 from scipy.optimize import linear_sum_assignment
 
+# --- global CLI options so helpers can see them ---
+args = argparse.Namespace()
 
 # --------------------------------------------------------------------------- #
 #   Mask evaluation (ported from evaluate_masks.py)                           #
@@ -71,33 +73,20 @@ def compute_mask_metrics(pred_mask, gt_mask, thr):
     iou       = tp / (tp + fp + fn) if (tp + fp + fn) else 0.0
     return {'iou': iou, 'precision': precision, 'recall': recall, 'f1': f1}
 
-# --------------------------------------------------------------------------- #
-#   Ground-truth dict → 7-tuple conversion                                    #
-# --------------------------------------------------------------------------- #
-
-def dict_to_7tuple(d):
+def frame_boxes(json_list):
     """
-    Convert a JRDB annotation dict to [cx, cy, cz, w, l, h, yaw].
-    Handles two common layouts:
-
-      1. {'translation': [x,y,z], 'size': [w,l,h], 'rotation_y': yaw, ...}
-      2. {'cx': x, 'cy': y, 'cz': z, 'w': w, 'l': l, 'h': h, 'yaw': yaw}
-
-    Returns None if parsing fails.
+    Return an (N,7) float32 array extracted from one frame’s label list.
+    Skips boxes whose attributes['no_eval'] is True.
     """
-    if 'translation' in d and 'size' in d:                     # layout 1
-        cx, cy, cz  = d['translation'][:3]
-        w,  l,  h   = d['size'][:3]
-        yaw         = d.get('rotation_y', 0.0)
-        return [cx, cy, cz, w, l, h, yaw]
-
-    if all(k in d for k in ('cx', 'cy', 'cz', 'w', 'l', 'h', 'yaw')):  # layout 2
-        return [d['cx'], d['cy'], d['cz'],
-                d['w'],  d['l'],  d['h'],  d['yaw']]
-
-    # fallback: first seven numeric values
-    nums = [v for v in d.values() if isinstance(v, (int, float))]
-    return nums[:7] if len(nums) >= 7 else None
+    out = []
+    for ann in json_list:
+        if ann.get('attributes', {}).get('no_eval', False):
+            continue
+        b = ann['box']
+        out.append([b['cx'], b['cy'], b['cz'],
+                    b['w'],  b['l'],  b['h'],
+                    b.get('rot_z', 0.0)])
+    return np.asarray(out, np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +121,7 @@ def bbox_iou_3d(b1, b2):
     """
     b1 = b1.copy(); b2 = b2.copy()
     # b1[5] *= 1.2;  b2[5] *= 1.2 
-    b1[5] *= 1.5;  b2[5] *= 1.5 
+    # b1[5] *= 1.5;  b2[5] *= 1.5 
     
     # volumes
     v1 = b1[3] * b1[4] * b1[5]
@@ -208,7 +197,7 @@ def compute_box_metrics(pred_boxes, gt_boxes, iou_thr):
 #   Main evaluation loop                                                      #
 # --------------------------------------------------------------------------- #
 
-def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
+def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0, max_range=None):
     """
     pred_root : directory containing bboxes/ and masks/ trees collected by LV‑DOT
     gt_root   : directory containing JRDB ground‑truth trees
@@ -243,11 +232,14 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0):
             pred_boxes = np.load(os.path.join(p_bbox_dir, fname))
             # -------- ground‑truth from in‑memory JSON -----------------------
             frame_key = fname.replace('.npy', '.pcd')
-            tuples = [dict_to_7tuple(item['box'])
-                      for item in seq_labels.get(frame_key, [])
-                      if dict_to_7tuple(item['box']) is not None]
-            gt_boxes = np.asarray(tuples, dtype=np.float32) if tuples else \
-                       np.empty((0, 7), np.float32)
+            gt_boxes = frame_boxes(seq_labels.get(frame_key, []))
+            
+            # Optional radial crop
+            if max_range is not None:
+                keep_p = np.sqrt(np.sum(pred_boxes[:, :2]**2, axis=1)) <= max_range
+                keep_g = np.sqrt(np.sum(gt_boxes[:, :2]**2, axis=1))   <= max_range
+                pred_boxes = pred_boxes[keep_p]
+                gt_boxes   = gt_boxes[keep_g]
                        
             if args.max_range is not None:
                 keep_p = np.sqrt(pred_boxes[:,0]**2 + pred_boxes[:,1]**2) <= args.max_range
@@ -293,14 +285,16 @@ if __name__ == '__main__':
     ap.add_argument('--leg_crop', type=float, default=0.0,
                     help="Ignore this height (m) from the bottom of each "
                          "box when computing IoU (default 0.0 = use full box).")
+    ap.add_argument('--max_distance', type=float, default=None,
+                    help="Skip GT / pred boxes whose centre radius exceeds this (m)")
     args = ap.parse_args()
     
     globals()['args'] = args   # expose to helper fns (max_range, leg_crop)
 
     seq_scores = evaluate(args.pred_dir, args.gt_dir,
                           box_iou_thr=args.box_iou_thr,
-                          mask_thr=args.mask_thr)
-
+                          mask_thr=args.mask_thr,
+                          max_range=args.max_distance)
     if not seq_scores:
         print("No sequences evaluated – check directory paths.")
         exit(1)
