@@ -46,6 +46,8 @@ if hasattr(np.core, '_multiarray_umath'):
     sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
 from scipy.optimize import linear_sum_assignment
 
+import csv
+
 # --- global CLI options so helpers can see them ---
 args = argparse.Namespace()
 
@@ -287,9 +289,13 @@ if __name__ == '__main__':
                          "box when computing IoU (default 0.0 = use full box).")
     ap.add_argument('--max_distance', type=float, default=None,
                     help="Skip GT / pred boxes whose centre radius exceeds this (m)")
+    ap.add_argument('--ego_map', default=None,
+                    help="Path to CSV (seq,category) listing ego‑motion class "
+                         "for each sequence; categories should be "
+                         "'no', 'minimal', or 'significant'.")
     args = ap.parse_args()
-    
-    globals()['args'] = args   # expose to helper fns (max_range, leg_crop)
+
+    globals()['args'] = args   # make CLI flags visible to helper fns
 
     seq_scores = evaluate(args.pred_dir, args.gt_dir,
                           box_iou_thr=args.box_iou_thr,
@@ -299,12 +305,31 @@ if __name__ == '__main__':
         print("No sequences evaluated – check directory paths.")
         exit(1)
 
+    # ------------------------------------------------------------------
+    #   Load ego‑motion mapping if provided
+    # ------------------------------------------------------------------
+    ego_map = {}
+    if args.ego_map:
+        with open(args.ego_map) as f:
+            rdr = csv.reader(f)
+            for row in rdr:
+                if len(row) >= 2:
+                    ego_map[row[0].strip()] = row[1].strip().lower()
+    cat_boxes, cat_masks = {}, {}
+
     # print per‑sequence and overall means
     overall_boxes = {'iou': [], 'precision': [], 'recall': [], 'f1': []}
     overall_masks = {'iou': [], 'precision': [], 'recall': [], 'f1': []}
 
     for seq, res in seq_scores.items():
         b, m = res['boxes'], res['masks']
+        # determine ego‑motion category if mapping provided
+        category = None
+        if args.ego_map and seq in ego_map:
+            category = ego_map[seq]
+            if category not in cat_boxes:
+                cat_boxes[category] = {'iou': [], 'precision': [], 'recall': [], 'f1': []}
+                cat_masks[category] = {'iou': [], 'precision': [], 'recall': [], 'f1': []}
         print(f"=== {seq} ===")
         print("  Bounding boxes")
         print(f"    IoU:       {b['iou']:.3f}")
@@ -315,11 +340,21 @@ if __name__ == '__main__':
         print(f"    IoU:       {m['iou']:.3f}")
         print(f"    Precision: {m['precision']:.3f}")
         print(f"    Recall:    {m['recall']:.3f}")
+        print(f"    F1:        {m['f1']:.3f}")
+        print("  Moving (mask‑based)")
+        print(f"    IoU:       {m['iou']:.3f}")
+        print(f"    Precision: {m['precision']:.3f}")
+        print(f"    Recall:    {m['recall']:.3f}")
         print(f"    F1:        {m['f1']:.3f}\n")
 
         for k in overall_boxes:
             overall_boxes[k].append(b[k])
             overall_masks[k].append(m[k])
+
+        if category:
+            for k in cat_boxes[category]:
+                cat_boxes[category][k].append(b[k])
+                cat_masks[category][k].append(m[k])
 
     mean_boxes = {k: np.mean(v) for k, v in overall_boxes.items()}
     mean_masks = {k: np.mean(v) for k, v in overall_masks.items()}
@@ -335,3 +370,16 @@ if __name__ == '__main__':
     print(f"  Precision: {mean_masks['precision']:.3f}")
     print(f"  Recall:    {mean_masks['recall']:.3f}")
     print(f"  F1:        {mean_masks['f1']:.3f}")
+    print("\nMoving (mask‑based)")
+    print(f"  IoU:       {mean_masks['iou']:.3f}")
+    print(f"  Precision: {mean_masks['precision']:.3f}")
+    print(f"  Recall:    {mean_masks['recall']:.3f}")
+    print(f"  F1:        {mean_masks['f1']:.3f}")
+
+    if cat_boxes:
+        print("\n=== BY EGO‑MOTION CATEGORY ===")
+        for cat in sorted(cat_boxes.keys()):
+            mb = {k: np.mean(v) for k, v in cat_boxes[cat].items()}
+            mm = {k: np.mean(v) for k, v in cat_masks[cat].items()}
+            print(f"[{cat.upper():>11}]  Boxes  IoU {mb['iou']:.3f}  P {mb['precision']:.3f}  R {mb['recall']:.3f}  F1 {mb['f1']:.3f} │ "
+                  f"Masks  IoU {mm['iou']:.3f}  P {mm['precision']:.3f}  R {mm['recall']:.3f}  F1 {mm['f1']:.3f}")

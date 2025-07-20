@@ -43,6 +43,7 @@ from visualization_msgs.msg import Marker
 from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion
 from scipy.spatial.transform import Rotation as Rsci
+from typing import Optional
 
 
 # --------------------------------------------------------------------------- #
@@ -104,8 +105,23 @@ class FinalBBoxCollector:
         self.results_base = rospy.get_param('~results_dir',
                                             '/scratch/gaurav_kumar/results')
         self.sequence     = rospy.get_param('~sequence', None)
-        
-                # ------------------------------------------------------------------
+
+        # --- frame sanity ----------------------------------------------------
+        # Marker frame as published by dynamicDetector (e.g., "map", "upper_velodyne", "base_link"...)
+        self.marker_expected_frame = rospy.get_param('~marker_expected_frame', None)
+        # If True we will *not* apply the static body→lidar offset nor the pose_list
+        # compensation when the incoming markers already appear to be in a JRDB world
+        # frame (map / upper_velodyne).  This prevents the disastrous "double‑transform"
+        # that produced huge drifts in high‑ego‑motion sequences.
+        self.disable_reframe_if_world = rospy.get_param('~disable_reframe_if_world', True)
+        # Explicit switch to enable pose compensation (world trajectory → per‑frame lidar).
+        # Leave False unless you *know* the markers are in a stable world frame and the
+        # pointclouds are in the *moving* lidar frame.
+        self.apply_pose_compensation = rospy.get_param('~apply_pose_compensation', False)
+        # Remember most recent incoming frame_id so _pcd_cb can decide what to do.
+        self._last_marker_frame: Optional[str] = None
+
+        # ------------------------------------------------------------------
         #   Bounding-box post-scaling (tune predicted boxes to GT size)
         # ------------------------------------------------------------------
         # Uniform lateral scale applied to width & length (default 1.30 ≈ torso → full-body)
@@ -156,6 +172,8 @@ class FinalBBoxCollector:
             self.body_T_lidar = np.array(body2lidar_param, dtype=np.float32).reshape(4, 4)
 
         # I/O /onboard_detector/tracked_bboxes
+        # NOTE: We subscribe to dynamic_bboxes because you only want moving objects.
+        # DO NOT change unless you intend to include stationary tracks.
         rospy.Subscriber('/onboard_detector/dynamic_bboxes',
                         MarkerArray, self._box_cb, queue_size=10)
         # rospy.Subscriber('/onboard_detector/tracked_bboxes',
@@ -172,12 +190,33 @@ class FinalBBoxCollector:
     # --------------------------------------------------------------------- #
 
     def _box_cb(self, msg: MarkerArray):
-        # If the incoming MarkerArray is not in the desired frame, pull TF once
-        if self.use_tf and msg.markers and msg.markers[0].header.frame_id != self.target_frame:
+        # Record the source frame of the incoming markers.
+        if msg.markers:
+            self._last_marker_frame = msg.markers[0].header.frame_id
+
+        # Decide whether we need to transform marker centres into target_frame.
+        src_frame = msg.markers[0].header.frame_id if msg.markers else None
+        rot_q, trans = None, None
+        need_tf = False
+        if self.use_tf and src_frame and src_frame != self.target_frame:
+            need_tf = True
+        # If TF not requested but we have a static offset *and* the markers are
+        # obviously in a body frame (heuristic: frame name contains "base" or "body"),
+        # we will apply the static body→lidar transform unless disabled.
+        if (not need_tf) and self.static_tf_ok:
+            if self.disable_reframe_if_world and src_frame in ('map','upper_velodyne',self.target_frame):
+                # Already a world/JRDB frame — do nothing.
+                pass
+            else:
+                need_tf = True
+                rot_q = self.static_rot
+                trans = self.static_trans
+        if need_tf and rot_q is None:
+            # Pull TF transform dynamically
             try:
                 tf = self.tf_buffer.lookup_transform(
                     self.target_frame,
-                    msg.markers[0].header.frame_id,
+                    src_frame,
                     msg.markers[0].header.stamp,
                     rospy.Duration(0.1))
                 rot_q = np.array([tf.transform.rotation.x,
@@ -191,8 +230,6 @@ class FinalBBoxCollector:
                     tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException):
                 rot_q, trans = None, None
-        else:
-            rot_q, trans = None, None
 
         boxes, objs = [], []
         for m in msg.markers:
@@ -232,7 +269,7 @@ class FinalBBoxCollector:
                 w = V_local[:, 0].ptp()
                 l = V_local[:, 1].ptp()
                 h = V_local[:, 2].ptp()
-                        # ------------------------------------------------------------------
+            # ------------------------------------------------------------------
             # 2b.  Scale and clamp so predicted boxes match JRDB GT dimensions
             # ------------------------------------------------------------------
             w *= self.bbox_scale_xy
@@ -243,13 +280,11 @@ class FinalBBoxCollector:
             l = max(l, self.bbox_min_dims[1])
             h = max(h, self.bbox_min_dims[2])
 
-            # ------------------------------------------------------------------
-            # 3. Optional transform into target_frame
-            # ------------------------------------------------------------------
-            if rot_q is not None:
+            # 3. Optional re‑framing
+            if rot_q is not None and trans is not None:
+                # rot_q may be numpy or list; Rotation wants array‑like
                 centre = R.from_quat(rot_q).apply(centre) + trans
-            elif self.static_tf_ok:
-                centre = R.from_quat(self.static_rot).apply(centre) + self.static_trans
+            # else: leave in source frame (assumed already world/JRDB)
 
             cx, cy, cz = centre.tolist()
             boxes.append([cx, cy, cz, w, l, h, yaw])
@@ -273,18 +308,31 @@ class FinalBBoxCollector:
         with self.lock:
             boxes_arr = self.latest_boxes_arr.copy()
             boxes_obj = list(self.latest_boxes_obj)
+        # Short‑circuit: If we have decided NOT to re‑frame markers (they are already
+        # in the JRDB world frame) then we must also NOT apply pose compensation below.
+        apply_pose = self.apply_pose_compensation
+        if self.disable_reframe_if_world and (self._last_marker_frame in ('map','upper_velodyne',self.target_frame)):
+            apply_pose = False
 
-        # ---- Pose‑based map→lidar transform -----------------------------------
-        if self.body_T_lidar is not None and hasattr(self, "pose_list") and self.pose_list and self.frame_idx < len(self.pose_list):
-            world_T_body = self.pose_list[self.frame_idx]      # map==world frame
+        # ---- Optional map→current‑lidar pose compensation -------------------
+        if apply_pose and self.body_T_lidar is not None and hasattr(self, "pose_list") and \
+           self.pose_list and self.frame_idx < len(self.pose_list):
+            # Transform predicted boxes (currently in world/map) into the *per‑frame*
+            # upper_velodyne sensor frame expected by JRDB files.
+            world_T_body  = self.pose_list[self.frame_idx]      # 4x4
             world_T_lidar = world_T_body @ self.body_T_lidar
             lidar_T_world = np.linalg.inv(world_T_lidar)
-
+            # transform box centres
             for bi, bb in enumerate(boxes_obj):
                 hom = np.array([bb.center[0], bb.center[1], bb.center[2], 1.0], dtype=np.float32)
-                centre_lidar = lidar_T_world @ hom
-                boxes_arr[bi, :3] = centre_lidar[:3]
-                bb.center = centre_lidar[:3]
+                centre_lidar = (lidar_T_world @ hom)[:3]
+                boxes_arr[bi, :3] = centre_lidar
+                bb.center = centre_lidar
+            # also transform the *incoming* pointcloud (currently in world coords) into lidar frame
+            # defer actual transform until after we read pts (see below)
+            cloud_pose_xform = lidar_T_world
+        else:
+            cloud_pose_xform = None
 
         # ---- Bring cloud into the same frame as the boxes ----------------------
         if self.use_tf and pcd_msg.header.frame_id != self.target_frame:
@@ -327,6 +375,14 @@ class FinalBBoxCollector:
                                                    skip_nans=True,
                                                    field_names=('x', 'y', 'z'))],
                        dtype=np.float32)
+        # If the raw cloud is in world coords but we applied a pose compensation above,
+        # bring the points into the same lidar frame.
+        if cloud_pose_xform is not None:
+            # homogeneous multiply
+            N = pts.shape[0]
+            pts_h = np.ones((N,4), dtype=np.float32)
+            pts_h[:,:3] = pts
+            pts = (cloud_pose_xform @ pts_h.T).T[:,:3].astype(np.float32)
         pts_t = pts.T                                 # 3×N
         masks = [points_in_box(b, pts_t) for b in boxes_obj]
         mask_any = np.any(np.stack(masks), axis=0) if masks else \
