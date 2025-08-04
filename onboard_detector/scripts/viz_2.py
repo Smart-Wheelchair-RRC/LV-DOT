@@ -13,9 +13,7 @@ For each frame *f* present in *both* directories it logs
 
 Usage
 -----
-python3 viz_2.py \
-    --gt_mask_dir   /path/to/JRDB/masks/upper_velodyne/<sequence> \
-    --pred_mask_dir /path/to/results/masks/upper_velodyne/<sequence>
+python3 viz_2.py --sequence clark-center-2019-02-28_1 --max_range 5 --recording_id custom_id
 
 Optional:
     --recording_id <str>   Supply a custom Rerun recording id
@@ -100,6 +98,14 @@ def _yaw_to_quat(yaw: np.ndarray) -> np.ndarray:
         np.sin(yaw * 0.5),  # z
     ])
 
+def _filter_boxes_by_range(boxes: np.ndarray, max_range: float) -> np.ndarray:
+    """Filter boxes based on radial distance of their centers."""
+    if boxes.size == 0:
+        return boxes
+    centers = boxes[:, :3]
+    radial_dist = np.linalg.norm(centers[:, :2], axis=1)
+    return boxes[radial_dist <= max_range]
+
 # --------------------------------------------------------------------------- #
 #   Main visualisation                                                        #
 # --------------------------------------------------------------------------- #
@@ -161,6 +167,16 @@ def visualise(
 
         # --- 3-D overlay of mask points --------------------------------
         xyz = get_pcd(fid)
+        # Log the full raw LiDAR scan for context
+        if xyz is not None and xyz.size:
+            rr.log(
+                "/scan/points3d",
+                rr.Points3D(
+                    positions=xyz.astype(np.float32),
+                    colors=np.full_like(xyz, 128, dtype=np.uint8),  # neutral grey
+                    radii=0.02,
+                ),
+            )
         if xyz is not None:
             N_pts        = xyz.shape[0]
             N_mask_gt    = gt_mask.size
@@ -210,6 +226,10 @@ def visualise(
                     gt_boxes = frame_boxes_json(json.load(f))
             else:
                 gt_boxes = np.zeros((0,7), np.float32)
+
+        if max_range is not None:
+            gt_boxes = _filter_boxes_by_range(gt_boxes, max_range)
+
         # Log GT boxes
         if gt_boxes.ndim == 2 and gt_boxes.shape[1] == 7 and gt_boxes.size:
             rr.log(
@@ -232,6 +252,10 @@ def visualise(
             pr_boxes = frame_boxes_json(pr_json)
         else:
             pr_boxes = np.zeros((0,7), np.float32)
+
+        if max_range is not None:
+            pr_boxes = _filter_boxes_by_range(pr_boxes, max_range)
+            
         # Log predicted boxes
         if pr_boxes.ndim == 2 and pr_boxes.shape[1] == 7 and pr_boxes.size:
             rr.log(
@@ -254,31 +278,37 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Visualise ground‑truth & predicted masks side‑by‑side in Rerun"
     )
-    ap.add_argument("--gt_mask_dir", required=True,
-                    help="Directory of JRDB ground‑truth mask .npy files")
-    ap.add_argument("--pred_mask_dir", required=True,
-                    help="Directory of LV‑DOT predicted mask .npy files")
+    ap.add_argument("--sequence", required=True,
+                    help="Name of the JRDB sequence to visualise (e.g. 'clark-center-2019-02-28_1')")
+    ap.add_argument("--base_dir", default="/scratch",
+                    help="Base directory for data paths")
     ap.add_argument("--recording_id", default=None,
                      help="Optional custom Rerun recording id")
-    ap.add_argument("--gt_bbox_dir", required=False,
-                    help="Directory of GT 3-D bbox .npy files")
-    ap.add_argument("--pred_bbox_dir", required=False,
-                    help="Directory of predicted 3-D bbox .npy files")
-    ap.add_argument("--pcd_dir", required=False,
-                    help="Directory containing point‑cloud *.npy or *.pcd files for 3‑D mask overlay")
-    ap.add_argument("--gt_labels_json", required=False,
-                help="Path to JRDB labels_3d/<sequence>.json (single file containing all GT boxes)")
     ap.add_argument("--max_range", type=float, default=None,
                     help="Optional radial distance crop (metres) applied to PCD + masks")
     args = ap.parse_args()
 
+    # --- Construct paths from sequence name ---
+    sequence = args.sequence
+    base_dir = args.base_dir
+    
+    gt_base_path = os.path.join(base_dir, "aadith_warrier/JRDB")
+    pred_base_path = os.path.join(base_dir, "gaurav_kumar/results")
+
+    gt_mask_dir = os.path.join(gt_base_path, "masks/upper_velodyne", sequence)
+    pred_mask_dir = os.path.join(pred_base_path, "masks/upper_velodyne", sequence)
+    gt_bbox_dir = os.path.join(gt_base_path, "bboxes/upper_velodyne", sequence)
+    pred_bbox_dir = os.path.join(pred_base_path, "bboxes/upper_velodyne", sequence)
+    pcd_dir = os.path.join(gt_base_path, "pointclouds/upper_velodyne", sequence)
+    gt_labels_json = os.path.join(gt_base_path, "labels/labels_3d", f"{sequence}.json")
+
     visualise(
-        args.gt_mask_dir,
-        args.pred_mask_dir,
+        gt_mask_dir,
+        pred_mask_dir,
         args.recording_id,
-        args.gt_bbox_dir,
-        args.pred_bbox_dir,
-        args.pcd_dir,
-        args.gt_labels_json,
+        gt_bbox_dir,
+        pred_bbox_dir,
+        pcd_dir,
+        gt_labels_json,
         args.max_range,
     )

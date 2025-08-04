@@ -243,11 +243,24 @@ def evaluate(pred_root, gt_root, box_iou_thr=0.25, mask_thr=0.0, max_range=None)
                 pred_boxes = pred_boxes[keep_p]
                 gt_boxes   = gt_boxes[keep_g]
                        
+            # Consolidated range filtering using a single threshold
             if args.max_range is not None:
-                keep_p = np.sqrt(pred_boxes[:,0]**2 + pred_boxes[:,1]**2) <= args.max_range
-                keep_g = np.sqrt(gt_boxes[:,0]**2   + gt_boxes[:,1]**2)   <= args.max_range
+                # Use command-line argument value for consistency
+                effective_range = args.max_range
+                
+                # Calculate radial distance consistently for both pred and gt boxes
+                pred_radial = np.linalg.norm(pred_boxes[:, :2], axis=1)
+                gt_radial = np.linalg.norm(gt_boxes[:, :2], axis=1)
+                
+                # Apply filtering once
+                keep_p = pred_radial <= effective_range
+                keep_g = gt_radial <= effective_range
+                
+                # Filter boxes
                 pred_boxes = pred_boxes[keep_p]
-                gt_boxes   = gt_boxes[keep_g]
+                gt_boxes = gt_boxes[keep_g]
+                
+                print(f"Range filtering: kept {keep_p.sum()}/{len(keep_p)} pred boxes and {keep_g.sum()}/{len(keep_g)} GT boxes")
                 
             b_metrics  = compute_box_metrics(pred_boxes, gt_boxes, box_iou_thr)
             per_file_b.append(b_metrics)
