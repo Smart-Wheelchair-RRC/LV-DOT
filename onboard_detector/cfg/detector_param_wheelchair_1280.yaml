@@ -8,15 +8,15 @@ lidar_pointcloud_topic: /livox/pcd
 odom_topic: /localization
 
 # Camera Parameters
-depth_intrinsics: [386.2324523925781, 385.3044738769531, 324.0267639160156, 241.46470642089844] # fx,  fy, cx, cy realsense
-color_intrinsics: [386.2324523925781, 385.3044738769531, 324.0267639160156, 241.46470642089844] # intel realsense
+depth_intrinsics: [641.4490966796875, 639.9080200195312, 646.7113037109375, 362.441162109375] # fx,  fy, cx, cy realsense
+color_intrinsics: [426.7136535644531, 426.7136535644531, 425.2262878417969, 241.7610626220703] # intel realsense
 depth_scale_factor: 1000 # 1000 for Intel Realsense Camera
 depth_min_value: 0.5
 depth_max_value: 5.0
 depth_filter_margin: 10 # filter
 depth_skip_pixel: 2  # filter
-image_cols: 640
-image_rows: 480
+image_cols: 1280
+image_rows: 720
 
 # Sensor Transforms
 body_to_camera_color: [0.0,  0.0,  1.0,  -0.015,
@@ -74,4 +74,4 @@ dynamic_consistency_threshold: 15 # obstacles being voted as dynamic for continu
 # Constrain size
 target_constrain_size: true
 target_object_size: [0.5, 0.5, 1.5]
-max_object_size: [3.0, 3.0, 2.0] # filter out objects that are too large
+max_object_size: [2.0, 2.0, 2.0] # filter out objects that are too large
